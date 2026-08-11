@@ -27,9 +27,13 @@ const ACCENT = '#10b981';
 const BROADCAST_COLOR = '#818cf8';
 const GLOW = 'rgba(16,185,129,0.25)';
 
-const SOCKET_URL = window.location.hostname === 'localhost'
-  ? 'http://localhost:7291'
-  : `http://${window.location.hostname}:7291`;
+// Direct access is served on the Vite port (7292) and talks to the Python
+// server on 7291. Anywhere else — e.g. behind an HTTPS reverse proxy on a
+// domain — connect same-origin (undefined) so Socket.IO inherits the page's
+// scheme (wss://) and the proxy routes /socket.io/ to the server.
+const SOCKET_URL = window.location.port === '7292'
+  ? `${window.location.protocol}//${window.location.hostname}:7291`
+  : undefined;
 
 const HISTORY_KEY = 'iterm-cmd-history';
 const ACCESS_KEY_STORAGE_KEY = 'remote-iterm-access-key';
@@ -127,12 +131,21 @@ export default function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [showMap, setShowMap] = useState(false);
   const [keyboardMode, setKeyboardMode] = useState(false);
+  const [quickShift, setQuickShift] = useState(false);
   const [scrollLocked, setScrollLocked] = useState(false);
   const [broadcastMode, setBroadcastMode] = useState(false);
   const [broadcastTargets, setBroadcastTargets] = useState<Set<string>>(new Set());
   const [alertDone, setAlertDone] = useState(false);
   const [latency, setLatency] = useState<number | null>(null);
   const [isLandscape, setIsLandscape] = useState(window.matchMedia('(orientation: landscape)').matches);
+  // Desktop = a real keyboard and no touchscreen. There we drop the command box
+  // and stream keystrokes straight to the terminal (see the keydown effect).
+  const [isDesktop] = useState(() =>
+    window.matchMedia('(pointer: fine)').matches && navigator.maxTouchPoints === 0);
+  const [scrollLines, setScrollLines] = useState(() => {
+    const v = parseInt(localStorage.getItem('remote-iterm-scroll-lines') || '3', 10);
+    return Number.isFinite(v) && v >= 1 && v <= 10 ? v : 3;
+  });
   const [splitMode, setSplitMode] = useState(false);
   const [splitSessionId, setSplitSessionId] = useState<string | null>(null);
   const [splitContent, setSplitContent] = useState<StyledContent | null>(null);
@@ -147,6 +160,8 @@ export default function App() {
   // content arrives (cache lives in a ref, so it can't trigger renders itself).
   const [, setPreviewTick] = useState(0);
   const socketRef = useRef<Socket | null>(null);
+  const captureRef = useRef<HTMLTextAreaElement | null>(null);
+  const lastScrollFwdRef = useRef(0);
   const contentRef = useRef<HTMLDivElement>(null);
   const splitContentRef = useRef<HTMLDivElement>(null);
   const primaryAtBottomRef = useRef(true);
@@ -192,14 +207,15 @@ export default function App() {
       return;
     }
 
-    const s = io(SOCKET_URL, {
+    const socketOptions = {
       auth: { key: accessKey },
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
       timeout: 10000,
-    });
+    };
+    const s = SOCKET_URL ? io(SOCKET_URL, socketOptions) : io(socketOptions);
     socketRef.current = s;
 
     s.on('connect', () => {
@@ -628,11 +644,103 @@ export default function App() {
     socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys });
   };
 
+  // On desktop, when the browser view can't scroll further in the wheel's
+  // direction, forward a mouse-wheel event to the session so a fullscreen app
+  // (e.g. Claude Code, which lives in the alternate screen and has no browser
+  // scrollback) scrolls its own transcript. We send SGR mouse wheel events
+  // (button 64=up, 65=down) rather than PgUp/PgDn so it scrolls line-by-line
+  // instead of a half-page at a time. Otherwise let the browser scroll and pause
+  // follow-to-bottom while scrolled up. Throttled so a fast wheel doesn't flood.
+  const handleTerminalWheel = (
+    e: React.WheelEvent<HTMLDivElement>,
+    atBottomRef: React.MutableRefObject<boolean>,
+  ) => {
+    const el = e.currentTarget;
+    const atTop = el.scrollTop <= 0;
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
+    if (isDesktop && ((e.deltaY < 0 && atTop) || (e.deltaY > 0 && atBottom))) {
+      e.preventDefault();
+      const now = performance.now();
+      if (now - lastScrollFwdRef.current < 40) return;
+      lastScrollFwdRef.current = now;
+      // Repeat the wheel event `scrollLines` times so one wheel notch moves the
+      // user's configured number of lines.
+      sendSpecialKey((e.deltaY < 0 ? '\x1b[<64;1;1M' : '\x1b[<65;1;1M').repeat(scrollLines));
+      return;
+    }
+    if (e.deltaY < 0) atBottomRef.current = false;
+  };
+
+  const changeScrollLines = (delta: number) => setScrollLines((n) => {
+    const next = Math.min(10, Math.max(1, n + delta));
+    localStorage.setItem('remote-iterm-scroll-lines', String(next));
+    return next;
+  });
+
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText();
       if (text) socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys: text });
     } catch {}
+  };
+
+  // Desktop raw-typing keeps a hidden textarea (captureRef) focused: a focused
+  // editable is the only reliable way to receive paste events with image data
+  // over plain HTTP. Refocus it on window focus and on click, unless the user
+  // is selecting terminal text to copy.
+  useEffect(() => {
+    if (!isDesktop || !connected) return;
+    const focusCapture = () => {
+      if (window.getSelection()?.toString()) return;
+      captureRef.current?.focus();
+    };
+    focusCapture();
+    window.addEventListener('focus', focusCapture);
+    document.addEventListener('click', focusCapture);
+    return () => {
+      window.removeEventListener('focus', focusCapture);
+      document.removeEventListener('click', focusCapture);
+    };
+  }, [isDesktop, connected]);
+
+  const handleCaptureKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showMap || showSplitMap || showPaneMap || tabListTarget) return;
+    // Let paste combos through so the paste event fires. Sending Ctrl+V as a
+    // keystroke would make Claude Code paste the Mac's *current* clipboard
+    // before the freshly-pasted image is bridged onto it.
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'v' || e.key === 'V')) return;
+    const seq = encodeKeyEvent(e);
+    if (seq === null) return;
+    e.preventDefault();
+    sendSpecialKey(seq);
+  };
+
+  // An image is bridged onto the Mac pasteboard server-side (which then sends
+  // Ctrl+V so Claude Code ingests it); text is streamed straight to the pane.
+  const handleCapturePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const data = e.clipboardData;
+    if (!data) return;
+    const imageItem = Array.from(data.items).find((it) => it.type.startsWith('image/'));
+    if (imageItem) {
+      const file = imageItem.getAsFile();
+      if (file) {
+        e.preventDefault();
+        const reader = new FileReader();
+        reader.onload = () => {
+          socketRef.current?.emit('pasteImage', {
+            sessionId: getActiveSessionId(),
+            data: reader.result as string,
+          });
+        };
+        reader.readAsDataURL(file);
+        return;
+      }
+    }
+    const text = data.getData('text');
+    if (text) {
+      e.preventDefault();
+      sendSpecialKey(text);
+    }
   };
 
   const handleSplitDrag = (e: React.TouchEvent) => {
@@ -693,6 +801,22 @@ export default function App() {
 
   return (
     <div className="flex flex-col bg-[#0a0a0a] font-mono overflow-hidden select-none relative pt-safe pb-safe-root pl-safe pr-safe" style={{ height: '100dvh' }}>
+
+      {/* Hidden capture element for desktop raw-typing / paste (see effects). */}
+      {isDesktop && (
+        <textarea
+          ref={captureRef}
+          onKeyDown={handleCaptureKeyDown}
+          onPaste={handleCapturePaste}
+          onInput={(e) => { (e.target as HTMLTextAreaElement).value = ''; }}
+          autoFocus
+          aria-hidden="true"
+          className="absolute bottom-0 left-0 w-px h-px opacity-0 -z-10 pointer-events-none"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+        />
+      )}
 
       {/* ── Access Key Overlay ── */}
       {(!accessKey || authError) && (
@@ -1069,9 +1193,19 @@ export default function App() {
                   style={{ backgroundColor: splitMode && focusedPane === 'split' ? '#38bdf8' : ACCENT }}
                 />
               )}
-              <span className="font-semibold whitespace-nowrap">
+              <span className={`font-semibold truncate ${isLandscape ? 'max-w-[120px]' : 'max-w-[160px]'}`}>
                 {tab.title || tab.sessions[0]?.name || `Tab ${tab.index}`}
               </span>
+              {tabBarWindow.tabs.length > 1 && (
+                <span
+                  aria-label="close tab"
+                  onClick={(e) => { e.stopPropagation(); socketRef.current?.emit('closeTab', { tabId: tab.id }); }}
+                  onTouchStart={(e) => e.stopPropagation()}
+                  className="flex items-center justify-center w-5 h-5 -mr-1 rounded text-zinc-600 hover:text-red-400 active:text-red-400 flex-shrink-0"
+                >
+                  <X className="w-3 h-3" />
+                </span>
+              )}
               {isActive && (
                 <div
                   className="absolute bottom-0 left-3 right-3 h-[2px] rounded-full"
@@ -1149,6 +1283,7 @@ export default function App() {
           )}
           <div
             ref={contentRef}
+            onWheel={(event) => handleTerminalWheel(event, primaryAtBottomRef)}
             onScroll={(event) => {
               primaryAtBottomRef.current = isScrolledToBottom(event.currentTarget);
               loadEarlierContent('primary', selectedSessionId, content, event.currentTarget);
@@ -1156,7 +1291,7 @@ export default function App() {
             className="flex-1 overflow-auto relative min-h-0 min-w-0"
           >
             {content && content.lines.length ? (
-              <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: content.fg, backgroundColor: content.bg }}>
+              <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full select-text cursor-text" style={{ color: content.fg, backgroundColor: content.bg }}>
                 {content.lines.map((runs, i) => (
                   <span key={i}>
                     {runs.map((r, j) => (
@@ -1274,6 +1409,7 @@ export default function App() {
             </div>
             <div
               ref={splitContentRef}
+              onWheel={(event) => handleTerminalWheel(event, splitAtBottomRef)}
               onScroll={(event) => {
                 splitAtBottomRef.current = isScrolledToBottom(event.currentTarget);
                 loadEarlierContent('split', splitSessionId, splitContent, event.currentTarget);
@@ -1282,7 +1418,7 @@ export default function App() {
               style={{ borderLeft: `3px solid ${focusedPane === 'split' ? '#38bdf8' : '#38bdf830'}` }}
             >
               {splitContent && splitContent.lines.length ? (
-                <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
+                <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full select-text cursor-text" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
                   {splitContent.lines.map((runs, i) => (
                     <span key={i}>
                       {runs.map((r, j) => (
@@ -1344,9 +1480,12 @@ export default function App() {
         <QuickBtn label="^Z" onClick={() => sendSpecialKey('\x1a')} color="#fbbf24" />
         <QuickBtn label="^L" onClick={() => sendSpecialKey('\x0c')} color="#38bdf8" />
         <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
-        <QuickBtn icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[A')} color="#a78bfa" />
-        <QuickBtn icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[B')} color="#a78bfa" />
-        <QuickBtn label="TAB" onClick={() => sendSpecialKey('\t')} color="#818cf8" />
+        {/* Shift modifier: when active, the arrows/TAB emit their shifted CSI
+            sequences (e.g. Shift+Up = ESC[1;2A, back-tab = ESC[Z). */}
+        <QuickBtn label="⇧" onClick={() => setQuickShift((s) => !s)} color="#a78bfa" active={quickShift} />
+        <QuickBtn icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey(quickShift ? '\x1b[1;2A' : '\x1b[A')} color="#a78bfa" />
+        <QuickBtn icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey(quickShift ? '\x1b[1;2B' : '\x1b[B')} color="#a78bfa" />
+        <QuickBtn label="TAB" onClick={() => sendSpecialKey(quickShift ? '\x1b[Z' : '\t')} color="#818cf8" />
         {/* Real Return (CR, 0x0D): submits in shells AND raw-mode TUIs like Claude Code */}
         <QuickBtn icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\r')} color="#34d399" />
         {/* Newline (LF, 0x0A): the Shift+Enter equivalent — inserts a line without submitting */}
@@ -1355,16 +1494,35 @@ export default function App() {
         <QuickBtn icon={<Clipboard className="w-3.5 h-3.5" />} onClick={handlePaste} color="#38bdf8" />
         <QuickBtn icon={<Copy className="w-3.5 h-3.5" />} onClick={handleCopy} color="#71717a" />
         <QuickBtn icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x15')} color="#fb7185" />
+        {isDesktop && (
+          <>
+            <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
+            <div className="flex items-center gap-1 flex-shrink-0 text-[11px] font-bold text-zinc-400">
+              <span className="text-zinc-600 tracking-wide">SCROLL</span>
+              <button
+                onClick={() => changeScrollLines(-1)}
+                className="w-7 h-[36px] flex items-center justify-center rounded-lg border border-zinc-700/50 bg-zinc-800/40 active:scale-90"
+              >−</button>
+              <span className="w-4 text-center tabular-nums text-zinc-200">{scrollLines}</span>
+              <button
+                onClick={() => changeScrollLines(1)}
+                className="w-7 h-[36px] flex items-center justify-center rounded-lg border border-zinc-700/50 bg-zinc-800/40 active:scale-90"
+              >+</button>
+            </div>
+          </>
+        )}
       </div>
 
-      {/* ── Command Input / Virtual Keyboard ── */}
-      <div className={`bg-zinc-950/90 border-t border-zinc-800/60 flex-shrink-0 ${isLandscape ? 'p-1.5' : 'p-3'}`}>
-        {keyboardMode ? (
-          <VirtualKeyboard
-            onKey={(key) => sendSpecialKey(key)}
-            onExit={() => setKeyboardMode(false)}
-          />
-        ) : (
+      {/* ── Command Input / Virtual Keyboard (mobile only; on desktop you type
+          straight into the terminal, so there is no bottom bar) ── */}
+      {!isDesktop && (
+        <div className={`bg-zinc-950/90 border-t border-zinc-800/60 flex-shrink-0 ${isLandscape ? 'p-1.5' : 'p-3'}`}>
+          {keyboardMode ? (
+            <VirtualKeyboard
+              onKey={(key) => sendSpecialKey(key)}
+              onExit={() => setKeyboardMode(false)}
+            />
+          ) : (
           <div className="flex items-center gap-2">
             <button
               onClick={() => setKeyboardMode(true)}
@@ -1410,8 +1568,9 @@ export default function App() {
               </button>
             </div>
           </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       <style>{`
         .pt-safe { padding-top: env(safe-area-inset-top); }
@@ -1569,19 +1728,20 @@ function PaneSwitcher({ panes, selectedId, onSelect, onOpenMap }: {
 }
 
 // --- Quick Action Button ---
-function QuickBtn({ label, icon, onClick, color }: {
+function QuickBtn({ label, icon, onClick, color, active }: {
   label?: string;
   icon?: React.ReactNode;
   onClick: () => void;
   color: string;
+  active?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
       className="flex items-center justify-center min-w-[40px] h-[36px] px-2.5 rounded-lg border transition-all active:scale-90 flex-shrink-0"
       style={{
-        borderColor: color + '30',
-        backgroundColor: color + '10',
+        borderColor: active ? color : color + '30',
+        backgroundColor: active ? color + '30' : color + '10',
         color,
       }}
     >
@@ -1615,6 +1775,61 @@ const KB_ARROWS: { seq: string; Icon: typeof ChevronUp; label: string }[] = [
   { seq: '\x1b[B', Icon: ChevronDown, label: 'down' },
   { seq: '\x1b[C', Icon: ChevronRight, label: 'right' },
 ];
+
+// Translate a desktop keydown into the bytes a terminal expects, or null for
+// keys we don't handle (and browser/OS shortcuts we deliberately let through).
+// Anything that returns null stays reachable via the on-screen Quick Actions.
+function encodeKeyEvent(e: {
+  key: string; ctrlKey: boolean; altKey: boolean; metaKey: boolean; shiftKey: boolean;
+}): string | null {
+  const { key, ctrlKey, altKey, metaKey, shiftKey } = e;
+
+  if (key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') return null;
+  // Leave Cmd/Win shortcuts (copy, paste, tab switch, …) to the browser/OS.
+  if (metaKey) return null;
+
+  // Ctrl+key -> C0 control code (Ctrl+A = 0x01 … Ctrl+Z = 0x1a, plus the rest).
+  if (ctrlKey && !altKey && key.length === 1) {
+    const lower = key.toLowerCase();
+    if (lower >= 'a' && lower <= 'z') return String.fromCharCode(lower.charCodeAt(0) - 96);
+    const ctl: Record<string, string> = {
+      '[': '\x1b', '\\': '\x1c', ']': '\x1d', '^': '\x1e', '_': '\x1f', ' ': '\x00',
+    };
+    return key in ctl ? ctl[key] : null;
+  }
+
+  // CSI sequences, with an optional shift modifier (";2").
+  const csi = (final: string) => (shiftKey ? `\x1b[1;2${final}` : `\x1b[${final}`);
+  const tilde = (n: number) => (shiftKey ? `\x1b[${n};2~` : `\x1b[${n}~`);
+  const FKEYS: Record<string, string> = {
+    F1: '\x1bOP', F2: '\x1bOQ', F3: '\x1bOR', F4: '\x1bOS',
+    F5: '\x1b[15~', F6: '\x1b[17~', F7: '\x1b[18~', F8: '\x1b[19~',
+    F9: '\x1b[20~', F10: '\x1b[21~', F11: '\x1b[23~', F12: '\x1b[24~',
+  };
+
+  switch (key) {
+    case 'Enter': return '\r';
+    case 'Backspace': return '\x7f';
+    case 'Tab': return shiftKey ? '\x1b[Z' : '\t';
+    case 'Escape': return '\x1b';
+    case 'ArrowUp': return csi('A');
+    case 'ArrowDown': return csi('B');
+    case 'ArrowRight': return csi('C');
+    case 'ArrowLeft': return csi('D');
+    case 'Home': return csi('H');
+    case 'End': return csi('F');
+    case 'PageUp': return tilde(5);
+    case 'PageDown': return tilde(6);
+    case 'Insert': return tilde(2);
+    case 'Delete': return tilde(3);
+  }
+  if (key in FKEYS) return FKEYS[key];
+
+  // Printable character, Alt-prefixed with ESC when the Alt/Option key is held.
+  if (key.length === 1) return altKey ? '\x1b' + key : key;
+
+  return null;
+}
 
 function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onExit: () => void }) {
   const [shift, setShift] = useState(false);
