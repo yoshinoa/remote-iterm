@@ -1,0 +1,28 @@
+# Copy this to `Caddyfile` (same directory) and edit the domain below.
+#
+# When a file named `Caddyfile` exists here AND `caddy` is installed, the
+# iterm-server launcher starts and stops Caddy alongside the server, and allows
+# this domain through the server's CORS automatically (no need to set
+# REMOTE_ITERM_ORIGINS yourself).
+#
+# Reaching it over Tailscale: point this domain's DNS at the Mac's tailnet IP
+# (e.g. 100.x.y.z) via Tailscale split-DNS or an A record. Because that IP is
+# not publicly reachable, Caddy cannot use the HTTP / TLS-ALPN challenge — use
+# the DNS-01 challenge with your DNS provider (needs a Caddy build that includes
+# that DNS plugin), or provide your own cert with `tls <cert> <key>`.
+#
+# Note: binding 443 on macOS requires elevated privileges. Either run the
+# launcher with the needed permissions, or use a high port in the site address
+# below (e.g. `term.example.com:8443`).
+
+term.example.com {
+	# Route the Socket.IO endpoint to the Python server; everything else to the
+	# client. Caddy negotiates the WebSocket upgrade automatically.
+	reverse_proxy /socket.io/* 127.0.0.1:7291
+	reverse_proxy 127.0.0.1:7292
+
+	# DNS-01 certificate (uncomment and set your provider + credentials):
+	# tls {
+	# 	dns <provider> <api-token>
+	# }
+}

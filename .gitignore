@@ -7,3 +7,8 @@ dist/
 .iterm-server.log
 *.log
 bun.lock
+
+# Local reverse-proxy setup (machine/secret-specific — see Caddyfile.example)
+/caddy
+/Caddyfile
+/.caddy.env

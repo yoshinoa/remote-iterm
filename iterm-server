@@ -15,6 +15,9 @@ LOGFILE="$DIR/.iterm-server.log"
 VENV="$DIR/server/.venv"
 REQ="$DIR/server/requirements.txt"
 STAMP="$VENV/.requirements.sha"
+# Optional HTTPS reverse proxy. If a Caddyfile exists and `caddy` is installed,
+# it is started/stopped with the server (see do_start / do_stop).
+CADDYFILE="$DIR/Caddyfile"
 
 get_local_ip() {
   ipconfig getifaddr en0 2>/dev/null || echo "localhost"
@@ -70,6 +73,22 @@ do_start() {
   ensure_venv || return 1
   shared_key="$("$VENV/bin/python" "$DIR/server/auth.py")" || return 1
 
+  # If a Caddyfile is present, allow its site domain through CORS so the client
+  # works when loaded via the HTTPS reverse proxy (unless already configured).
+  if [ -z "${REMOTE_ITERM_ORIGINS:-}" ] && [ -f "$CADDYFILE" ]; then
+    CADDY_ADDR=$(grep -m1 -oE '^[[:space:]]*[A-Za-z0-9.-]+\.[A-Za-z]{2,}(:[0-9]+)?' "$CADDYFILE" | tr -d '[:space:]')
+    if [ -n "$CADDY_ADDR" ]; then
+      CADDY_HOST="${CADDY_ADDR%%:*}"
+      # Allow the clean-URL origin (https://host, for access via a 443 redirect)
+      # and, when a port is set, the explicit-port origin too.
+      if [ "$CADDY_ADDR" = "$CADDY_HOST" ]; then
+        export REMOTE_ITERM_ORIGINS="https://$CADDY_HOST"
+      else
+        export REMOTE_ITERM_ORIGINS="https://$CADDY_HOST,https://$CADDY_ADDR"
+      fi
+    fi
+  fi
+
   # exec in the subshell so $! is the real daemon pid (not the subshell wrapper),
   # which keeps the pidfile accurate for `stop`.
   ( cd "$DIR/server" && exec "$VENV/bin/python" -u server.py >> "$LOGFILE" 2>&1 ) &
@@ -78,7 +97,24 @@ do_start() {
   ( cd "$DIR/client" && exec npx vite --host --port 7292 --strictPort >> "$LOGFILE" 2>&1 ) &
   CLIENT_PID=$!
 
-  echo "$SERVER_PID $CLIENT_PID" > "$PIDFILE"
+  # Optional HTTPS reverse proxy, brought up and torn down with the server.
+  # Prefer the plugin-enabled ./caddy (built with the DNS provider module) over
+  # a plain Homebrew caddy, and load secrets (e.g. CLOUDFLARE_API_TOKEN) from a
+  # gitignored .caddy.env so the DNS-01 challenge can authenticate.
+  CADDY_PID=""
+  if [ -f "$CADDYFILE" ]; then
+    CADDY_BIN="$DIR/caddy"
+    [ -x "$CADDY_BIN" ] || CADDY_BIN="$(command -v caddy 2>/dev/null)"
+    if [ -n "$CADDY_BIN" ]; then
+      if [ -f "$DIR/.caddy.env" ]; then
+        set -a; . "$DIR/.caddy.env"; set +a
+      fi
+      ( exec "$CADDY_BIN" run --config "$CADDYFILE" --adapter caddyfile >> "$LOGFILE" 2>&1 ) &
+      CADDY_PID=$!
+    fi
+  fi
+
+  echo "$SERVER_PID $CLIENT_PID $CADDY_PID" > "$PIDFILE"
 
   IP=$(get_local_ip)
   URL="http://${IP}:7292/#key=${shared_key}"
@@ -104,6 +140,11 @@ print()
 print("  Scan the QR from your phone (same Wi-Fi)")
 print()
 PYQR
+
+  if [ -n "$CADDY_PID" ]; then
+    echo "  HTTPS:    via Caddy → ${REMOTE_ITERM_ORIGINS:-see Caddyfile}"
+    echo
+  fi
 }
 
 do_stop() {
