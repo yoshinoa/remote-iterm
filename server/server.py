@@ -10,11 +10,16 @@ adding pane watches and structured, styled terminal content for the rewritten
 client.
 """
 import asyncio
+import base64
+import binascii
 import ctypes
 import json
 import math
+import os
 import resource
 import signal
+import socket
+import subprocess
 import sys
 
 import iterm2
@@ -27,6 +32,15 @@ except ImportError:  # Running server.py directly from the server directory.
     from auth import is_valid_key, load_or_create_key
 
 PORT = 7291
+CLIENT_PORT = 7292  # Vite client origin the phone/browser is served from.
+
+# Reject a single execute/sendKeys/broadcast payload larger than this many bytes.
+# Ample for real pastes while blocking memory-exhaustion floods from a client
+# that authenticated but then misbehaves.
+MAX_INPUT_BYTES = 1_048_576
+
+# Upper bound on a pasted image (decoded bytes) written to the Mac pasteboard.
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
 
 # Watched panes receive only their recent tail on each screen change. Older
 # content is fetched in pages when the client scrolls upward, avoiding a full
@@ -38,7 +52,50 @@ STREAM_MIN_INTERVAL = 0.05  # At most 20 live snapshots per second/session.
 MAX_SOCKET_QUEUE_DEPTH = 2
 MAX_WATCHED_SESSIONS = 2
 
-sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
+def _local_ipv4s() -> set[str]:
+    """Every IPv4 address bound to a local interface (LAN, Tailscale/VPN, …)."""
+    ips: set[str] = set()
+    try:
+        out = subprocess.run(
+            ["/sbin/ifconfig"], capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0] == "inet":
+                ips.add(fields[1])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # Fallback in case ifconfig is unavailable for some reason.
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return ips
+
+
+def client_origins() -> list[str]:
+    """Web origins allowed to open a Socket.IO connection.
+
+    Only the client app — served on CLIENT_PORT from this machine — is a
+    legitimate origin, so we allow every local address it could be loaded from
+    (loopback plus each interface's IPv4, including the LAN and any Tailscale/VPN
+    address) on that port, and reject everything else. This blocks arbitrary web
+    pages and DNS-rebinding hosts that a wildcard (`cors_allowed_origins="*"`)
+    let through, while still working over Tailscale.
+
+    Set REMOTE_ITERM_ORIGINS (comma-separated, e.g. "https://term.example.com")
+    to allow additional origins — needed when serving behind an HTTPS reverse
+    proxy on a domain, where the browser's Origin is that domain, not a local IP.
+    """
+    hosts = {"localhost", "127.0.0.1"} | _local_ipv4s()
+    origins = {f"http://{host}:{CLIENT_PORT}" for host in hosts}
+    extra = os.environ.get("REMOTE_ITERM_ORIGINS", "")
+    origins |= {o.strip() for o in extra.split(",") if o.strip()}
+    return sorted(origins)
+
+
+sio = socketio.AsyncServer(
+    async_mode="aiohttp", cors_allowed_origins=client_origins())
 app = web.Application()
 sio.attach(app)
 
@@ -580,11 +637,77 @@ def current_active_session_id() -> str | None:
 
 
 def resolve_session(session_id: str | None) -> iterm2.Session | None:
+    # Fail safe: a missing/invalid/unknown id resolves to nothing rather than
+    # silently falling back to whatever pane happens to be focused — otherwise a
+    # malformed request would send keystrokes to the pane the user is actively
+    # using.
     if itermapp is not None and session_id and session_id != "undefined":
-        session = itermapp.get_session_by_id(session_id)
-        if session is not None:
-            return session
-    return current_session()
+        return itermapp.get_session_by_id(session_id)
+    return None
+
+
+def _valid_input(value) -> str | None:
+    """Return text safe to forward to a session, or None to reject it.
+
+    Guards the mutating handlers against non-string payloads and oversized
+    floods from an authenticated-but-hostile client (see MAX_INPUT_BYTES).
+    """
+    if not isinstance(value, str):
+        return None
+    if len(value.encode("utf-8", "ignore")) > MAX_INPUT_BYTES:
+        return None
+    return value
+
+
+def _image_uti(raw: bytes) -> str | None:
+    """The pasteboard UTI for a known image format, from its magic bytes."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "public.png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "public.jpeg"
+    if raw[:4] in (b"II*\x00", b"MM\x00*"):
+        return "public.tiff"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "com.compuserve.gif"
+    return None
+
+
+def set_clipboard_image(raw: bytes) -> bool:
+    """Write raw image bytes to the Mac pasteboard under their native type.
+
+    Writing the original bytes (rather than round-tripping through NSImage,
+    whose lazy TIFF conversion fails in this headless process) preserves the
+    image exactly, which is what Claude Code reads on its Ctrl+V image paste.
+    AppKit is imported lazily so importing this module on a non-macOS host (e.g.
+    for tests) never requires it.
+    """
+    uti = _image_uti(raw)
+    if uti is None:
+        return False
+    try:
+        from AppKit import NSPasteboard
+        from Foundation import NSData
+    except ImportError:
+        return False
+    nsdata = NSData.dataWithBytes_length_(raw, len(raw))
+    pasteboard = NSPasteboard.generalPasteboard()
+    pasteboard.clearContents()
+    return bool(pasteboard.setData_forType_(nsdata, uti))
+
+
+def decode_image_payload(value) -> bytes | None:
+    """Decode a base64 (optionally data-URL) image payload, bounded in size."""
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("data:"):
+        _, _, value = value.partition(",")
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if not raw or len(raw) > MAX_IMAGE_BYTES:
+        return None
+    return raw
 
 
 # --- Live streaming of watched sessions ----------------------------------------
@@ -771,7 +894,9 @@ async def on_get_earlier_content(sid, data):
 
 @sio.on("execute")
 async def on_execute(sid, data):
-    command = data.get("command", "")
+    command = _valid_input(data.get("command", ""))
+    if command is None:
+        return
     session = resolve_session(data.get("sessionId"))
     if session is not None:
         # CR (0x0D), not LF: a real Return submits in shells (ICRNL maps CR->NL)
@@ -781,7 +906,9 @@ async def on_execute(sid, data):
 
 @sio.on("broadcast")
 async def on_broadcast(sid, data):
-    command = data.get("command", "")
+    command = _valid_input(data.get("command", ""))
+    if command is None:
+        return
     session_ids = data.get("sessionIds") or []
     sessions = [itermapp.get_session_by_id(s) for s in session_ids] if itermapp else []
     await asyncio.gather(*(
@@ -791,10 +918,25 @@ async def on_broadcast(sid, data):
 
 @sio.on("sendKeys")
 async def on_send_keys(sid, data):
-    keys = data.get("keys", "")
+    keys = _valid_input(data.get("keys", ""))
+    if keys is None:
+        return
     session = resolve_session(data.get("sessionId"))
     if session is not None:
         await session.async_send_text(keys)
+
+
+@sio.on("pasteImage")
+async def on_paste_image(sid, data):
+    # Bridge a client-pasted image onto the Mac pasteboard, then send Ctrl+V so
+    # the focused app (e.g. Claude Code's image paste) ingests it — the image
+    # bytes never travel through the TTY.
+    raw = decode_image_payload(data.get("data"))
+    if raw is None or not set_clipboard_image(raw):
+        return
+    session = resolve_session(data.get("sessionId"))
+    if session is not None:
+        await session.async_send_text("\x16")  # Ctrl+V
 
 
 @sio.on("newTab")
@@ -805,11 +947,35 @@ async def on_new_tab(sid):
     await push_state()
 
 
+def find_tab(tab_id: str):
+    if itermapp is None or not tab_id:
+        return None
+    for window in itermapp.windows:
+        for tab in window.tabs:
+            if tab.tab_id == tab_id:
+                return tab
+    return None
+
+
 @sio.on("closeTab")
-async def on_close_tab(sid):
-    session = current_session()
-    if session is not None:
-        await session.async_close()
+async def on_close_tab(sid, data=None):
+    # Refuse to close the last remaining tab: it would close iTerm's last window
+    # (potentially quitting the app) and drop the API connection, which looks
+    # like the server "hanging". The client also hides close on a lone tab.
+    if itermapp is not None and sum(len(w.tabs) for w in itermapp.windows) <= 1:
+        return
+    tab_id = data.get("tabId") if isinstance(data, dict) else None
+    try:
+        if tab_id:
+            tab = find_tab(tab_id)
+            if tab is not None:
+                await tab.async_close(force=True)
+        else:
+            session = current_session()
+            if session is not None:
+                await session.async_close()
+    except Exception as err:
+        print(f"closeTab error: {err}")
     await push_state()
 
 
