@@ -295,6 +295,7 @@ async def build_state() -> list:
             tabs.append({
                 "index": index,
                 "id": f"{window.window_id}-{index}",
+                "tabId": tab.tab_id,
                 "title": tab_title or "",
                 "isSelected": tab.tab_id == current_tab_id,
                 "currentSessionId": cur_sess.session_id if cur_sess else "",

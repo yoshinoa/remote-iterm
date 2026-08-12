@@ -5,7 +5,7 @@ import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight
 // --- Types ---
 interface PaneRect { x: number; y: number; w: number; h: number; }
 interface Session { id: string; name: string; rect?: PaneRect; }
-interface Tab { index: number; id: string; title?: string; isSelected: boolean; currentSessionId?: string; aspect?: number; maximized?: boolean; sessions: Session[]; }
+interface Tab { index: number; id: string; tabId: string; title?: string; isSelected: boolean; currentSessionId?: string; aspect?: number; maximized?: boolean; sessions: Session[]; }
 interface Bounds { x: number; y: number; w: number; h: number; }
 interface WindowState { id: string; isFront: boolean; tabs: Tab[]; bounds?: Bounds; }
 interface ScreenSize { width: number; height: number; }
@@ -1199,7 +1199,7 @@ export default function App() {
               {tabBarWindow.tabs.length > 1 && (
                 <span
                   aria-label="close tab"
-                  onClick={(e) => { e.stopPropagation(); socketRef.current?.emit('closeTab', { tabId: tab.id }); }}
+                  onClick={(e) => { e.stopPropagation(); socketRef.current?.emit('closeTab', { tabId: tab.tabId }); }}
                   onTouchStart={(e) => e.stopPropagation()}
                   className="flex items-center justify-center w-5 h-5 -mr-1 rounded text-zinc-600 hover:text-red-400 active:text-red-400 flex-shrink-0"
                 >
