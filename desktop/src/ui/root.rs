@@ -1,15 +1,17 @@
 use crate::config::Config;
 use crate::connection::{self, ConnHandle, ServerEvent};
+use crate::keys::{KeyInput, encode_key, paste_sequence};
 use crate::model::{Effect, Model};
-use crate::prediction::Predictor;
+use crate::prediction::{PredictKey, Predictor};
 use crate::ui::terminal::{TermStyle, compose_row, render_row};
 use crate::ui::theme;
 use futures::StreamExt;
+use base64::Engine;
 use gpui::{
-    Context, FocusHandle, IntoElement, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
+    ClipboardEntry, Context, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct RootView {
     pub(crate) model: Model,
@@ -23,6 +25,7 @@ pub struct RootView {
     pub(crate) ever_connected: bool,
     pub(crate) auth_rejected: bool,
     events_task: Option<Task<()>>,
+    tick_task: Option<Task<()>>,
 }
 
 impl RootView {
@@ -47,6 +50,7 @@ impl RootView {
             ever_connected: false,
             auth_rejected: false,
             events_task: None,
+            tick_task: None,
         };
         view.connect(cx);
         view
@@ -176,6 +180,109 @@ impl RootView {
         cx.notify();
     }
 
+    pub(crate) fn send_to_terminal(&mut self, keys: &str, predict: Option<PredictKey>, cx: &mut Context<Self>) {
+        let Some(session) = self.model.session_id.clone() else {
+            return;
+        };
+        if let Some(conn) = &self.conn {
+            conn.send_keys(&session, keys);
+        }
+        match (predict, self.model.shown()) {
+            (Some(key), Some(screen)) => self.predictor.on_key(&session, key, screen, Instant::now()),
+            _ => self.predictor.reset(),
+        }
+        self.scroll_to_bottom();
+        self.ensure_tick(cx);
+        cx.notify();
+    }
+
+    fn ensure_tick(&mut self, cx: &mut Context<Self>) {
+        if self.tick_task.is_some() || !self.predictor.has_pending() {
+            return;
+        }
+        self.tick_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                let keep = this.update(cx, |view, cx| {
+                    view.predictor.tick(Instant::now());
+                    cx.notify();
+                    if !view.predictor.has_pending() {
+                        view.tick_task = None;
+                        return false;
+                    }
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.model.session_id.clone() else {
+            return;
+        };
+        let item = cx.read_from_clipboard();
+        let image = item.as_ref().and_then(|item| {
+            item.entries().iter().find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = image {
+            let data = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+            if let Some(conn) = &self.conn {
+                conn.paste_image(&session, format!("data:{};base64,{data}", image.format.mime_type()));
+            }
+            self.predictor.reset();
+            cx.notify();
+            return;
+        }
+        match item.and_then(|item| item.text()).filter(|text| !text.is_empty()) {
+            Some(text) => self.send_to_terminal(&paste_sequence(&text), None, cx),
+            None => self.send_to_terminal("\x16", None, cx),
+        }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let m = keystroke.modifiers;
+        let plain_ctrl = m.control && !m.alt && !m.platform && !m.shift;
+        if plain_ctrl {
+            if let Some(n) = keystroke.key.parse::<u8>().ok().filter(|n| (1..=9).contains(n)) {
+                let effects = self.model.select_tab_number(n);
+                self.apply_effects(effects, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if keystroke.key == "v" {
+                self.paste(cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        let input = KeyInput {
+            key: &keystroke.key,
+            key_char: keystroke.key_char.as_deref(),
+            ctrl: m.control,
+            alt: m.alt,
+            shift: m.shift,
+            platform: m.platform,
+        };
+        let Some(seq) = encode_key(&input) else {
+            return;
+        };
+        let mut chars = seq.chars();
+        let predict = match (chars.next(), chars.next()) {
+            (Some('\x7f'), None) => Some(PredictKey::Backspace),
+            (Some(c), None) if !c.is_control() && !m.control && !m.alt => Some(PredictKey::Char(c)),
+            _ => None,
+        };
+        self.send_to_terminal(&seq, predict, cx);
+        cx.stop_propagation();
+    }
+
     fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.model.tab_id.clone();
         let tabs: Vec<(String, SharedString)> = self
@@ -289,6 +396,7 @@ impl Render for RootView {
             .flex_col()
             .bg(theme::color(theme::BACKGROUND))
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_tab_bar(cx))
             .child(self.render_terminal(cx))
     }

@@ -94,3 +94,85 @@ fn reconnect_rewatches_the_shown_session(cx: &mut TestAppContext) {
     assert!(sent.contains(&("watch".into(), json!({"sessionIds": ["s1"]}))));
     assert!(sent.contains(&("getContent".into(), json!({"sessionId": "s1"}))));
 }
+
+fn ready(cx: &mut TestAppContext) -> Harness<'_> {
+    let mut h = harness(cx);
+    h.send(ServerEvent::State(state()));
+    h.send(ServerEvent::Content(prompt("s1", "")));
+    h.sent();
+    h
+}
+
+fn keys_sent(sent: &[(String, Value)]) -> Vec<String> {
+    sent.iter()
+        .filter(|(event, _)| event == "sendKeys")
+        .map(|(_, data)| {
+            assert_eq!(data["sessionId"], "s1");
+            data["keys"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+fn overlay(h: &Harness) -> Vec<(i64, usize, char)> {
+    h.view.read_with(h.cx, |view, _| view.predictor.overlay().iter().map(|o| (o.line, o.col, o.ch)).collect())
+}
+
+#[gpui::test]
+fn typed_keys_are_sent_in_order(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.simulate_keystrokes("a b ctrl-w enter backspace up");
+    let sent = h.sent();
+    assert_eq!(keys_sent(&sent), vec!["a", "b", "\x17", "\r", "\x7f", "\x1b[A"]);
+}
+
+#[gpui::test]
+fn ctrl_number_switches_tab(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.simulate_keystrokes("ctrl-2");
+    let sent = h.sent();
+    assert!(sent.contains(&("focus".into(), json!({"windowId": "W1", "tabIndex": 2}))));
+    assert!(sent.contains(&("watch".into(), json!({"sessionIds": ["s2"]}))));
+    assert!(sent.iter().all(|(event, _)| event != "sendKeys"));
+    h.cx.simulate_keystrokes("ctrl-9");
+    assert!(h.sent().contains(&("focus".into(), json!({"windowId": "W1", "tabIndex": 3}))));
+}
+
+#[gpui::test]
+fn prediction_draws_after_first_echo_and_enter_resets(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.simulate_keystrokes("a");
+    assert!(overlay(&h).is_empty());
+    h.send(ServerEvent::Content(prompt("s1", "a")));
+    h.cx.simulate_keystrokes("b c");
+    assert_eq!(overlay(&h), vec![(101, 3, 'b'), (101, 4, 'c')]);
+    h.cx.simulate_keystrokes("enter");
+    assert!(overlay(&h).is_empty());
+}
+
+#[gpui::test]
+fn ctrl_v_pastes_text_bracketed(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.write_to_clipboard(gpui::ClipboardItem::new_string("echo a\necho b".into()));
+    h.cx.simulate_keystrokes("ctrl-v");
+    assert_eq!(keys_sent(&h.sent()), vec!["\x1b[200~echo a\necho b\x1b[201~"]);
+}
+
+#[gpui::test]
+fn ctrl_v_with_image_sends_paste_image(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0x89, b'P', b'N', b'G']);
+    h.cx.write_to_clipboard(gpui::ClipboardItem::new_image(&image));
+    h.cx.simulate_keystrokes("ctrl-v");
+    let sent = h.sent();
+    let (_, data) = sent.iter().find(|(event, _)| event == "pasteImage").expect("pasteImage sent");
+    assert_eq!(data["sessionId"], "s1");
+    assert_eq!(data["data"], "data:image/png;base64,iVBORw==");
+    assert!(keys_sent(&sent).is_empty());
+}
+
+#[gpui::test]
+fn ctrl_v_with_empty_clipboard_sends_literal(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.simulate_keystrokes("ctrl-v");
+    assert_eq!(keys_sent(&h.sent()), vec!["\x16"]);
+}

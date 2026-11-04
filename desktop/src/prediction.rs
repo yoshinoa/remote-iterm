@@ -49,24 +49,10 @@ impl Predictor {
         self.confirmed_epoch = false;
     }
 
-    fn effective_cell(&self, screen: &Content, line: i64, col: usize) -> Option<Cell> {
-        self.pending
-            .iter()
-            .rev()
-            .find(|p| p.line == line && p.col == col)
-            .map(|p| Cell { ch: p.expected, dim: false })
-            .or_else(|| screen.cell(line, col))
-    }
-
-    fn can_predict_at(&self, screen: &Content, line: i64, col: usize) -> bool {
-        let Some(text) = screen.line_text(line) else {
-            return false;
-        };
-        if text.chars().any(|c| c.width() != Some(1)) {
-            return false;
-        }
-        let len = text.chars().count();
-        (col..len).all(|c| is_blank(self.effective_cell(screen, line, c)))
+    fn can_predict_on(&self, screen: &Content, line: i64) -> bool {
+        screen
+            .line_text(line)
+            .is_some_and(|text| text.chars().all(|c| c.width() == Some(1)))
     }
 
     fn push(&mut self, screen: &Content, line: i64, col: usize, expected: char, now: Instant) {
@@ -89,7 +75,7 @@ impl Predictor {
         let Some(columns) = screen.columns.map(|c| c as usize) else {
             return self.reset();
         };
-        if !screen.is_latest || !self.can_predict_at(screen, line, col) {
+        if !screen.is_latest || !self.can_predict_on(screen, line) {
             return self.reset();
         }
         match key {
@@ -339,11 +325,27 @@ mod tests {
     }
 
     #[test]
-    fn no_prediction_mid_line() {
+    fn predicts_over_text_right_of_the_cursor() {
+        let now = Instant::now();
+        let mut p = confirmed_at("e", now);
+        let suggested = screen(vec![r("❯ e"), cur(), r("xit"), r("          ✔ │ 17:18:33")]);
+        p.on_key("s1", PredictKey::Char('x'), &suggested, now);
+        assert_eq!(p.overlay(), vec![cell('x', 3)]);
+        p.on_content("s1", &screen(vec![r("❯ ex"), cur(), r("it"), r("          ✔ │ 17:18:33")]), now);
+        assert!(p.overlay().is_empty());
+        p.on_key("s1", PredictKey::Char('q'), &screen(vec![r("❯ ex"), cur(), r("it")]), now);
+        assert_eq!(p.overlay(), vec![cell('q', 4)]);
+    }
+
+    #[test]
+    fn mid_line_insert_that_shifts_text_resets() {
         let now = Instant::now();
         let mut p = confirmed_at("a", now);
         let mid = screen(vec![r("❯ a"), cur(), r("bc")]);
-        p.on_key("s1", PredictKey::Char('x'), &mid, now);
+        p.on_key("s1", PredictKey::Char('X'), &mid, now);
+        p.on_key("s1", PredictKey::Char('Y'), &mid, now);
+        assert_eq!(p.overlay(), vec![cell('X', 3), cell('Y', 4)]);
+        p.on_content("s1", &screen(vec![r("❯ aX"), cur(), r("bc")]), now);
         assert!(p.overlay().is_empty());
         assert_hidden_epoch(&mut p, now);
     }

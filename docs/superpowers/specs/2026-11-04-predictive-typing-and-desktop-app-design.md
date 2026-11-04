@@ -276,11 +276,12 @@ starts a new **epoch**. That covers:
 
 **When not to predict.** In these cases the key is still sent, and the real
 screen does the echo:
-- **Real text to the right of the cursor.** If the cursor line has non-blank
-  text to the right of the cursor that isn't dim, it's mid-line editing.
-  Insert vs overwrite is unknown. Dim text counts as blank, because Claude
-  Code shows its prompt suggestion as dim text after the cursor (seen in live
-  sessions).
+- **(Revised during implementation)** Text to the right of the cursor no
+  longer blocks prediction. The user's zsh (powerlevel10k) draws its
+  autosuggestion in plain grey and its right prompt on the same line, so that
+  rule would have disabled prediction in the shell entirely. Prediction now
+  always overwrites at the cursor, as mosh does. A mid-line insert that shifts
+  text contradicts the next pending cell and triggers the normal undo.
 - **End of the line.** The next character would go past column `columns`.
 - **Not at the live screen.** The view is scrolled into history, or the cursor
   isn't in the loaded lines.
