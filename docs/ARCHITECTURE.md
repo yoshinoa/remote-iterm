@@ -71,6 +71,38 @@ The Vite/React client maintains the selected window, tab, and session separately
 
 The client is an installable PWA, but it is still a web application served by the Mac. There is no cloud relay or hosted control plane.
 
+### Native desktop client (`desktop/`)
+
+A Rust/[GPUI](https://gpui.rs) app, mainly for Windows (it also runs on macOS
+for development). It speaks the same Socket.IO contract as the web client and
+needs nothing new on the Mac. Build and usage notes are in
+`desktop/README.md`.
+
+Modules:
+
+| Module | Responsibility |
+| --- | --- |
+| `protocol` | Serde types for `state` and `content`, plus `merge_content` (a port of the web client's `mergeStyledContent`) |
+| `connection` | A tokio thread running `rust_socketio`, with its own reconnect loop and a 1 s `ping` heartbeat (a link is declared lost after 4 s without an ack). The server emits `state`/`content` before its connect ack, so the first event counts as connected |
+| `model` | Window, tab and pane selection, following the Mac like the web client. Changes are returned as effects (watch, getContent, focus, reset prediction) |
+| `prediction` | Predictive echo (below) |
+| `keys`, `mouse`, `geometry` | Terminal key encoding and paste sequences, SGR mouse reports, and pixel-to-cell mapping and selection text |
+| `config` | `desktop.json` (server URL, key, window bounds) and parsing of QR links |
+| `ui` | GPUI views. They only translate input into model, prediction and connection calls |
+
+**Predictive echo** works in the style of mosh:
+- **Drawing:** a printable key or Backspace is sent first, then drawn at the
+  cursor straight away as an overwrite.
+- **Confirming:** each live snapshot confirms a prediction when its cell shows
+  the expected character, keeps it while the cell is unchanged, and otherwise
+  throws away every pending prediction.
+- **Epochs:** an epoch starts after Enter, any non-printing key, a paste,
+  mouse input, a tab or pane switch, a contradiction, or a 1 s timeout.
+  Predictions in a new epoch stay hidden until one is confirmed, so password
+  prompts and vim's normal mode never show guessed characters.
+- **Dim text:** it counts as blank, since that's Claude Code's prompt
+  suggestion. A prediction is never confirmed by a dim cell.
+
 ## Socket.IO contract
 
 The protocol intentionally evolves the upstream event names where possible so the UI and backend remain loosely coupled.
@@ -92,6 +124,8 @@ The protocol intentionally evolves the upstream event names where possible so th
 | client → server | `renameSession` | Rename one iTerm session |
 | client → server | `focus` | Activate an iTerm window and tab on the Mac |
 | bidirectional ack | `ping` | Measure application-level round-trip latency |
+
+`content` and `historyContent` also carry the session's grid size (`columns`, `rows`), which the desktop client uses for prediction. After a `sendKeys`, that session's stream skips the `STREAM_MIN_INTERVAL` bundling wait for `KEYSTROKE_WINDOW` (100 ms), so echoes aren't delayed when something else on screen is changing.
 
 Styled terminal content is run-length encoded. Each run uses `t` for text and may include `f` (foreground), `g` (background), `b` (bold), `d` (faint), or `c` (cursor). Omitted colors inherit the pane's default `fg` and `bg` values.
 
