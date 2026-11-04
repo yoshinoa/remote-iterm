@@ -1,3 +1,4 @@
+mod config;
 mod geometry;
 mod keys;
 mod mouse;
