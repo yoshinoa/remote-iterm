@@ -247,6 +247,7 @@ class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.stop()
         clients.clear()
+        server_module.keystroke_at.clear()
 
     async def test_first_change_after_a_quiet_spell_is_sent_immediately(self):
         await asyncio.sleep(self.INTERVAL * 1.5)
@@ -270,6 +271,30 @@ class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(burst), 3)
         for earlier, later in zip(burst, burst[1:]):
             self.assertGreaterEqual(later - earlier, self.INTERVAL * 0.95)
+
+    async def test_change_soon_after_a_keystroke_skips_the_wait(self):
+        await asyncio.sleep(self.INTERVAL * 1.5)
+        self.session.notifications.put_nowait(None)
+        await asyncio.sleep(0.01)
+        server_module.note_keystroke("session-1")
+        before = len(self.sent)
+        changed_at = asyncio.get_running_loop().time()
+        self.session.notifications.put_nowait(None)
+        await asyncio.sleep(self.INTERVAL / 4)
+        self.assertEqual(len(self.sent), before + 1)
+        self.assertLess(self.sent[-1] - changed_at, self.INTERVAL / 4)
+
+    async def test_keystroke_window_expires(self):
+        with mock.patch.object(server_module, "KEYSTROKE_WINDOW", 0.05):
+            await asyncio.sleep(self.INTERVAL * 1.5)
+            self.session.notifications.put_nowait(None)
+            await asyncio.sleep(0.01)
+            first = self.sent[-1]
+            server_module.note_keystroke("session-1")
+            await asyncio.sleep(0.08)
+            self.session.notifications.put_nowait(None)
+            await asyncio.sleep(self.INTERVAL * 1.5)
+        self.assertGreaterEqual(self.sent[-1] - first, self.INTERVAL * 0.95)
 
 
 class InputValidationTest(unittest.TestCase):

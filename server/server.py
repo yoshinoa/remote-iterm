@@ -52,6 +52,7 @@ HISTORY_PAGE_LINES = 500
 PREVIEW_CONTENT_LINES = 40
 STREAM_MIN_INTERVAL = 0.05  # At most 20 live snapshots per second/session.
 MAX_SOCKET_QUEUE_DEPTH = 2
+KEYSTROKE_WINDOW = 0.1
 MAX_WATCHED_SESSIONS = 2
 
 def _local_ipv4s() -> set[str]:
@@ -117,6 +118,7 @@ screen_size = {"width": 1470, "height": 956}
 watched_by_sid: dict[str, set[str]] = {}
 stream_tasks: dict[str, asyncio.Task] = {}
 last_content: dict[str, dict] = {}
+keystroke_at: dict[str, float] = {}
 stream_reconcile_lock = asyncio.Lock()
 
 # Socket.IO/Engine.IO queues are unbounded. Keep a bounded, latest-wins
@@ -811,6 +813,10 @@ async def wait_for_clipboard_change(
 # every change. This is decoupled from iTerm's own focus, so the phone can watch
 # any pane — including a background split pane — and still get live updates.
 
+def note_keystroke(session_id: str) -> None:
+    keystroke_at[session_id] = asyncio.get_running_loop().time()
+
+
 async def stream_session(session_id: str) -> None:
     session = itermapp.get_session_by_id(session_id) if itermapp else None
     if session is None:
@@ -830,8 +836,10 @@ async def stream_session(session_id: str) -> None:
         async with session.get_screen_streamer(want_contents=False) as streamer:
             while True:
                 await streamer.async_get()
-                wait = last_read + STREAM_MIN_INTERVAL - loop.time()
-                if wait > 0:
+                now = loop.time()
+                wait = last_read + STREAM_MIN_INTERVAL - now
+                typed = now - keystroke_at.get(session_id, float("-inf")) <= KEYSTROKE_WINDOW
+                if wait > 0 and not typed:
                     await asyncio.sleep(wait)
                 last_read = loop.time()
                 if not clients:
@@ -1022,6 +1030,7 @@ async def on_send_keys(sid, data):
         return
     session = resolve_session(data.get("sessionId"))
     if session is not None:
+        note_keystroke(session.session_id)
         await session.async_send_text(keys)
 
 
