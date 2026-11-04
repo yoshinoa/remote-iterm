@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{self, Config, SavedWindow, parse_key_input};
 use crate::connection::{self, ConnHandle, ServerEvent};
 use crate::geometry::{point_to_cell, selection_text};
 use crate::keys::{KeyInput, encode_key, paste_sequence};
@@ -12,14 +12,16 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 use base64::Engine;
 use gpui::{
     Bounds, ClipboardEntry, DispatchPhase, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollDelta, ScrollWheelEvent, canvas, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, WindowBounds, ScrollDelta, ScrollWheelEvent, canvas, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 type Cellpos = (i64, usize);
+type Connector = fn(String, String) -> (ConnHandle, futures::channel::mpsc::UnboundedReceiver<ServerEvent>);
 
 struct Drag {
     mods: u8,
@@ -44,12 +46,18 @@ pub struct RootView {
     drag: Option<Drag>,
     history_pending: Option<i64>,
     wheel_accum: f32,
+    pub(crate) config_path: PathBuf,
+    pub(crate) clip_status: Option<bool>,
+    connector: Connector,
+    key_input: String,
+    clip_task: Option<Task<()>>,
+    save_task: Option<Task<()>>,
     events_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
 }
 
 impl RootView {
-    pub fn new(config: Config, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn build(config: Config, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&theme::terminal_font(false));
         let cell_width = text_system
@@ -58,7 +66,7 @@ impl RootView {
             .unwrap_or(px(theme::FONT_SIZE * 0.6));
         let focus = cx.focus_handle();
         window.focus(&focus);
-        let mut view = Self {
+        let view = Self {
             model: Model::default(),
             predictor: Predictor::new(),
             conn: None,
@@ -75,9 +83,21 @@ impl RootView {
             drag: None,
             history_pending: None,
             wheel_accum: 0.0,
+            config_path: config::config_path(),
+            clip_status: None,
+            connector: connection::start,
+            key_input: String::new(),
+            clip_task: None,
+            save_task: None,
             events_task: None,
             tick_task: None,
         };
+        cx.observe_window_bounds(window, |view: &mut Self, window, cx| view.schedule_save(window, cx)).detach();
+        view
+    }
+
+    pub fn new(config: Config, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::build(config, window, cx);
         view.connect(cx);
         view
     }
@@ -85,14 +105,103 @@ impl RootView {
     #[cfg(test)]
     pub(crate) fn attached(
         config: Config,
+        config_path: PathBuf,
         handle: ConnHandle,
         events: futures::channel::mpsc::UnboundedReceiver<ServerEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut view = Self::new(Config { key: None, ..config }, window, cx);
+        let mut view = Self::build(config, window, cx);
+        view.config_path = config_path;
+        view.connector = |_, _| {
+            let (handle, _) = ConnHandle::recording();
+            (handle, futures::channel::mpsc::unbounded().1)
+        };
         view.attach(handle, events, cx);
         view
+    }
+
+    pub(crate) fn key_screen_visible(&self) -> bool {
+        self.config.key.is_none() || self.auth_rejected
+    }
+
+    fn schedule_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = match window.window_bounds() {
+            WindowBounds::Windowed(b) => SavedWindow {
+                x: f32::from(b.origin.x),
+                y: f32::from(b.origin.y),
+                width: f32::from(b.size.width),
+                height: f32::from(b.size.height),
+                maximized: false,
+            },
+            WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => SavedWindow {
+                x: f32::from(b.origin.x),
+                y: f32::from(b.origin.y),
+                width: f32::from(b.size.width),
+                height: f32::from(b.size.height),
+                maximized: true,
+            },
+        };
+        let path = self.config_path.clone();
+        self.save_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let _ = config::remember_window(&path, saved);
+        }));
+    }
+
+    fn submit_key(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = parse_key_input(&self.key_input) else {
+            return;
+        };
+        self.key_input.clear();
+        self.config.key = Some(key.clone());
+        let mut stored = config::load(&self.config_path);
+        stored.key = Some(key);
+        let _ = config::save(&self.config_path, &stored);
+        self.connect(cx);
+        cx.notify();
+    }
+
+    fn on_key_screen_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let m = keystroke.modifiers;
+        if (m.control || m.platform) && keystroke.key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.key_input.push_str(text.trim());
+            }
+        } else if keystroke.key == "enter" {
+            self.submit_key(cx);
+        } else if keystroke.key == "backspace" {
+            self.key_input.pop();
+        } else if !m.control && !m.platform {
+            if let Some(ch) = keystroke.key_char.as_deref().or_else(|| (keystroke.key.chars().count() == 1).then_some(keystroke.key.as_str())) {
+                self.key_input.push_str(ch);
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn copy_mac_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(conn) = self.conn.clone() else {
+            return;
+        };
+        self.clip_task = Some(cx.spawn(async move |this, cx| {
+            let text = conn.clipboard_text().await.filter(|t| !t.is_empty());
+            let ok = text.is_some();
+            if let Some(text) = text {
+                let _ = cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+            }
+            let _ = this.update(cx, |view, cx| {
+                view.clip_status = Some(ok);
+                cx.notify();
+            });
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |view, cx| {
+                view.clip_status = None;
+                cx.notify();
+            });
+        }));
     }
 
     pub(crate) fn connect(&mut self, cx: &mut Context<Self>) {
@@ -103,7 +212,9 @@ impl RootView {
             return;
         };
         self.auth_rejected = false;
-        let (handle, events) = connection::start(self.config.server_url.clone(), key);
+        self.connected = false;
+        self.ever_connected = false;
+        let (handle, events) = (self.connector)(self.config.server_url.clone(), key);
         self.attach(handle, events, cx);
     }
 
@@ -169,7 +280,6 @@ impl RootView {
                 }
             }
             ServerEvent::History(content) => {
-                let session = content.session_id.clone();
                 let before = self.model.shown().map(|c| c.first_line);
                 if self.model.apply_history(content) {
                     self.history_pending = None;
@@ -177,12 +287,12 @@ impl RootView {
                     if let (Some(before), Some(after)) = (before, after) {
                         let added = usize::try_from(before - after).unwrap_or(0);
                         if added > 0 {
-                            let top = self.scroll.logical_scroll_top_index();
+                            let offset = -f32::from(self.scroll.0.borrow().base_handle.offset().y);
+                            let top = (offset / theme::LINE_HEIGHT).floor().max(0.0) as usize;
                             self.scroll.scroll_to_item(top + added, ScrollStrategy::Top);
                         }
                     }
                 }
-                let _ = session;
             }
         }
         cx.notify();
@@ -472,6 +582,10 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.key_screen_visible() {
+            self.on_key_screen_key(event, cx);
+            return;
+        }
         let keystroke = &event.keystroke;
         let m = keystroke.modifiers;
         let plain_ctrl = m.control && !m.alt && !m.platform && !m.shift;
@@ -521,47 +635,234 @@ impl RootView {
     }
 
     fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chip = |id: SharedString, active: bool| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_size(px(12.0))
+                .cursor_pointer()
+                .whitespace_nowrap()
+                .text_color(theme::color(if active { theme::ACCENT } else { theme::MUTED }))
+                .when(active, |d| d.bg(theme::color(theme::BORDER)))
+        };
+        let total_tabs: usize = self.model.windows.iter().map(|w| w.tabs.len()).sum();
+        let windows: Vec<(usize, String, bool)> = self
+            .model
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(ix, w)| (ix + 1, w.id.clone(), self.model.window_id.as_deref() == Some(w.id.as_str())))
+            .collect();
         let selected = self.model.tab_id.clone();
-        let tabs: Vec<(String, SharedString)> = self
+        let tabs: Vec<(u32, String, String, SharedString)> = self
             .model
             .current_tabs()
             .iter()
             .map(|t| {
                 let title = if t.title.is_empty() { format!("Tab {}", t.index) } else { t.title.clone() };
-                (t.id.clone(), title.into())
+                (t.index, t.id.clone(), t.tab_id.clone(), title.into())
             })
             .collect();
-        div()
+        let shown = self.model.session_id.clone();
+        let panes: Vec<(usize, String, SharedString)> = self
+            .model
+            .current_tab()
+            .map(|t| {
+                t.sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, s)| {
+                        let label = if s.name.is_empty() { format!("Pane {}", ix + 1) } else { s.name.clone() };
+                        (ix + 1, s.id.clone(), label.into())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let clip_label: SharedString = match self.clip_status {
+            Some(true) => "✓ copied".into(),
+            Some(false) => "✗ nothing".into(),
+            None => "Mac clipboard".into(),
+        };
+        let clip_color = match self.clip_status {
+            Some(true) => theme::ACCENT,
+            Some(false) => theme::DANGER,
+            None => theme::MUTED,
+        };
+
+        let mut bar = div()
             .flex()
             .flex_row()
             .flex_none()
+            .items_center()
             .gap_1()
             .px_2()
             .py_1()
             .bg(theme::color(theme::BAR))
             .border_b_1()
-            .border_color(theme::color(theme::BORDER))
-            .children(tabs.into_iter().enumerate().map(|(ix, (id, title))| {
-                let active = selected.as_deref() == Some(id.as_str());
+            .border_color(theme::color(theme::BORDER));
+        if windows.len() > 1 {
+            for (number, id, active) in windows {
+                bar = bar.child(
+                    chip(format!("window-{number}").into(), active)
+                        .debug_selector(move || format!("window-{number}"))
+                        .child(format!("W{number}"))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            let effects = view.model.select_window(&id);
+                            view.apply_effects(effects, cx);
+                        })),
+                );
+            }
+            bar = bar.child(div().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::color(theme::BORDER)));
+        }
+        for (index, id, tab_id, title) in tabs {
+            let active = selected.as_deref() == Some(id.as_str());
+            let mut tab = chip(format!("tab-{index}").into(), active)
+                .max_w(px(260.0))
+                .child(div().overflow_hidden().text_ellipsis().child(title))
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    let effects = view.model.select_tab(&id);
+                    view.apply_effects(effects, cx);
+                }));
+            if total_tabs > 1 {
+                tab = tab.child(
+                    div()
+                        .id(SharedString::from(format!("close-tab-{index}")))
+                        .debug_selector(move || format!("close-tab-{index}"))
+                        .px_1()
+                        .rounded_sm()
+                        .text_color(theme::color(theme::MUTED))
+                        .hover(|d| d.text_color(theme::color(theme::DANGER)))
+                        .child("×")
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if let Some(conn) = &view.conn {
+                                conn.close_tab(&tab_id);
+                            }
+                            cx.stop_propagation();
+                        })),
+                );
+            }
+            bar = bar.child(tab);
+        }
+        bar = bar.child(
+            chip("new-tab".into(), false)
+                .debug_selector(|| "new-tab".into())
+                .child("+")
+                .on_click(cx.listener(|view, _, _, _| {
+                    if let Some(conn) = &view.conn {
+                        conn.new_tab();
+                    }
+                })),
+        );
+        bar = bar.child(div().flex_1());
+        if panes.len() > 1 {
+            for (number, id, label) in panes {
+                let active = shown.as_deref() == Some(id.as_str());
+                bar = bar.child(
+                    chip(format!("pane-{number}").into(), active)
+                        .debug_selector(move || format!("pane-{number}"))
+                        .child(label)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            let effects = view.model.select_session(&id);
+                            view.apply_effects(effects, cx);
+                        })),
+                );
+            }
+            bar = bar.child(div().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::color(theme::BORDER)));
+        }
+        bar.child(
+            chip("mac-clipboard".into(), false)
+                .debug_selector(|| "mac-clipboard".into())
+                .text_color(theme::color(clip_color))
+                .child(clip_label)
+                .on_click(cx.listener(|view, _, _, cx| view.copy_mac_clipboard(cx))),
+        )
+    }
+
+    fn render_key_screen(&self) -> impl IntoElement {
+        let masked: SharedString = if self.key_input.is_empty() {
+            "Paste the QR link or the key, then press Enter".into()
+        } else {
+            "•".repeat(self.key_input.chars().count().min(48)).into()
+        };
+        div()
+            .id("key-screen")
+            .debug_selector(|| "key-screen".into())
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(theme::BACKGROUND))
+            .child(
                 div()
-                    .id(("tab", ix))
-                    .px_3()
-                    .py_1()
-                    .max_w(px(240.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
+                    .w(px(420.0))
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme::color(theme::BORDER))
+                    .bg(theme::color(theme::BAR))
+                    .child(div().text_size(px(12.0)).text_color(theme::color(theme::TEXT)).child("ACCESS KEY"))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::color(theme::BORDER))
+                            .text_size(px(12.0))
+                            .text_color(theme::color(if self.key_input.is_empty() { theme::MUTED } else { theme::TEXT }))
+                            .child(masked),
+                    )
+                    .when(self.auth_rejected, |d| {
+                        d.child(
+                            div()
+                                .id("key-rejected")
+                                .debug_selector(|| "key-rejected".into())
+                                .text_size(px(11.0))
+                                .text_color(theme::color(theme::DANGER))
+                                .child("That key was not accepted."),
+                        )
+                    }),
+            )
+    }
+
+    fn render_reconnecting(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(gpui::rgba(0x000000dd))
+            .child(div().text_color(theme::color(theme::TEXT)).child("Reconnecting…"))
+            .child(
+                div()
+                    .id("retry")
+                    .debug_selector(|| "retry".into())
+                    .px_4()
+                    .py_2()
                     .rounded_md()
-                    .text_size(px(12.0))
                     .cursor_pointer()
-                    .text_color(theme::color(if active { theme::ACCENT } else { theme::MUTED }))
-                    .when(active, |d| d.bg(theme::color(theme::BORDER)))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        let effects = view.model.select_tab(&id);
-                        view.apply_effects(effects, cx);
-                    }))
-                    .child(title)
-            }))
+                    .bg(theme::color(theme::ACCENT))
+                    .text_color(theme::color(theme::BACKGROUND))
+                    .child("Retry now")
+                    .on_click(cx.listener(|view, _, _, _| {
+                        if let Some(conn) = &view.conn {
+                            conn.reconnect_now();
+                        }
+                    })),
+            )
     }
 
     fn render_terminal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -674,7 +975,10 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let key_screen = self.key_screen_visible();
+        let reconnecting = !key_screen && self.ever_connected && !self.connected;
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -683,5 +987,7 @@ impl Render for RootView {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_tab_bar(cx))
             .child(self.render_terminal(cx))
+            .when(reconnecting, |d| d.child(self.render_reconnecting(cx)))
+            .when(key_screen, |d| d.child(self.render_key_screen()))
     }
 }

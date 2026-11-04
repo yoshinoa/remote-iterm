@@ -42,6 +42,7 @@ impl Harness<'_> {
             match cmd {
                 Command::Emit { event, data } => out.push((event.to_string(), data.unwrap_or(Value::Null))),
                 Command::Ack { event, data, .. } => out.push((format!("ack:{event}"), data.unwrap_or(Value::Null))),
+                Command::ReconnectNow => out.push(("reconnect".into(), Value::Null)),
                 _ => {}
             }
         }
@@ -49,11 +50,21 @@ impl Harness<'_> {
     }
 }
 
-pub(crate) fn harness(cx: &mut TestAppContext) -> Harness<'_> {
+fn harness_with_key<'a>(cx: &'a mut TestAppContext, key: Option<&str>) -> Harness<'a> {
     let (handle, commands) = ConnHandle::recording();
     let (events, rx) = futures::channel::mpsc::unbounded();
-    let (view, vcx) = cx.add_window_view(move |window, cx| RootView::attached(Config::default(), handle, rx, window, cx));
+    let config = Config { key: key.map(str::to_string), ..Config::default() };
+    let path = std::env::temp_dir()
+        .join(format!("remote-iterm-ui-test-{}-{}", std::process::id(), NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::SeqCst)))
+        .join("desktop.json");
+    let (view, vcx) = cx.add_window_view(move |window, cx| RootView::attached(config, path, handle, rx, window, cx));
     Harness { view, cx: vcx, events, commands }
+}
+
+static NEXT_DIR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn harness(cx: &mut TestAppContext) -> Harness<'_> {
+    harness_with_key(cx, Some("test-key"))
 }
 
 pub(crate) fn state() -> Vec<WindowState> {
@@ -312,4 +323,139 @@ fn ctrl_click_opens_link(cx: &mut TestAppContext) {
     h.cx.simulate_click(at, gpui::Modifiers::control());
     assert_eq!(h.cx.opened_url().as_deref(), Some("https://example.com/docs"));
     assert!(keys_sent(&h.sent()).is_empty());
+}
+
+fn redraw(h: &mut Harness) {
+    h.cx.run_until_parked();
+    h.cx.simulate_event(gpui::MouseMoveEvent {
+        position: gpui::point(gpui::px(1.0), gpui::px(1.0)),
+        pressed_button: None,
+        modifiers: gpui::Modifiers::none(),
+    });
+}
+
+fn click(h: &mut Harness, selector: &'static str) {
+    redraw(h);
+    let bounds = h.cx.debug_bounds(selector).unwrap_or_else(|| panic!("no element {selector}"));
+    h.cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+}
+
+fn exists(h: &mut Harness, selector: &'static str) -> bool {
+    redraw(h);
+    h.cx.debug_bounds(selector).is_some()
+}
+
+#[gpui::test]
+fn key_screen_takes_a_pasted_link_and_saves_it(cx: &mut TestAppContext) {
+    let mut h = harness_with_key(cx, None);
+    assert!(exists(&mut h, "key-screen"));
+    h.cx.write_to_clipboard(gpui::ClipboardItem::new_string("https://h:7292/#key=abc123".into()));
+    h.cx.simulate_keystrokes("ctrl-v enter");
+    let (key, path) = h.view.read_with(h.cx, |v, _| (v.config.key.clone(), v.config_path.clone()));
+    assert_eq!(key.as_deref(), Some("abc123"));
+    assert_eq!(crate::config::load(&path).key.as_deref(), Some("abc123"));
+    assert!(!h.view.read_with(h.cx, |v, _| v.key_screen_visible()));
+    assert!(keys_sent(&h.sent()).is_empty());
+}
+
+#[gpui::test]
+fn key_screen_typing_and_backspace(cx: &mut TestAppContext) {
+    let mut h = harness_with_key(cx, None);
+    h.cx.simulate_keystrokes("a b x backspace c enter");
+    assert_eq!(h.view.read_with(h.cx, |v, _| v.config.key.clone()).as_deref(), Some("abc"));
+}
+
+#[gpui::test]
+fn rejected_key_brings_back_the_key_screen(cx: &mut TestAppContext) {
+    let mut h = harness(cx);
+    assert!(!exists(&mut h, "key-screen"));
+    h.send(ServerEvent::AuthRejected);
+    assert!(exists(&mut h, "key-screen"));
+    assert!(exists(&mut h, "key-rejected"));
+}
+
+#[gpui::test]
+fn reconnect_overlay_appears_after_first_connect_and_retries(cx: &mut TestAppContext) {
+    let mut h = harness(cx);
+    h.send(ServerEvent::Disconnected);
+    assert!(!exists(&mut h, "retry"));
+    h.send(ServerEvent::Connected);
+    assert!(!exists(&mut h, "retry"));
+    h.send(ServerEvent::Disconnected);
+    click(&mut h, "retry");
+    assert!(h.sent().contains(&("reconnect".into(), Value::Null)));
+}
+
+#[gpui::test]
+fn tab_bar_close_and_new_buttons(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    click(&mut h, "close-tab-2");
+    let sent = h.sent();
+    assert!(sent.contains(&("closeTab".into(), json!({"tabId": "t2"}))));
+    assert!(sent.iter().all(|(e, _)| e != "focus"));
+    click(&mut h, "new-tab");
+    assert!(h.sent().contains(&("newTab".into(), Value::Null)));
+}
+
+#[gpui::test]
+fn lone_tab_has_no_close_button(cx: &mut TestAppContext) {
+    let mut h = harness(cx);
+    let mut s = state();
+    s[0].tabs.truncate(1);
+    h.send(ServerEvent::State(s));
+    assert!(exists(&mut h, "new-tab"));
+    assert!(!exists(&mut h, "close-tab-1"));
+}
+
+#[gpui::test]
+fn pane_switcher_changes_the_watched_session(cx: &mut TestAppContext) {
+    let mut h = harness(cx);
+    let mut s = state();
+    s[0].tabs[0].sessions.push(SessionInfo { id: "s1b".into(), name: "right".into(), rect: None });
+    h.send(ServerEvent::State(s));
+    h.sent();
+    click(&mut h, "pane-2");
+    assert!(h.sent().contains(&("watch".into(), json!({"sessionIds": ["s1b"]}))));
+}
+
+#[gpui::test]
+fn window_picker_switches_window(cx: &mut TestAppContext) {
+    let mut h = harness(cx);
+    let mut s = state();
+    s.push(WindowState {
+        id: "W2".into(),
+        is_front: false,
+        tabs: vec![TabState {
+            index: 1,
+            id: "W2-1".into(),
+            tab_id: "u1".into(),
+            title: "other".into(),
+            is_selected: true,
+            current_session_id: "s9".into(),
+            sessions: vec![SessionInfo { id: "s9".into(), name: String::new(), rect: None }],
+        }],
+    });
+    h.send(ServerEvent::State(s));
+    h.sent();
+    click(&mut h, "window-2");
+    assert!(h.sent().contains(&("focus".into(), json!({"windowId": "W2", "tabIndex": 1}))));
+}
+
+#[gpui::test]
+fn mac_clipboard_button_copies_text(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    click(&mut h, "mac-clipboard");
+    let sent = h.answer(|event| (event == "clipboardText").then(|| json!("from pbcopy")));
+    assert!(sent.iter().any(|(e, _)| e == "ack:clipboardText"));
+    assert_eq!(h.cx.read_from_clipboard().and_then(|i| i.text()).as_deref(), Some("from pbcopy"));
+    assert_eq!(h.view.read_with(h.cx, |v, _| v.clip_status), Some(true));
+}
+
+#[gpui::test]
+fn mac_clipboard_button_reports_nothing_to_copy(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    click(&mut h, "mac-clipboard");
+    h.answer(|_| None);
+    assert_eq!(h.cx.read_from_clipboard(), None);
+    assert_eq!(h.view.read_with(h.cx, |v, _| v.clip_status), Some(false));
 }

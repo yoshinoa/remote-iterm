@@ -54,6 +54,12 @@ pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
+pub fn remember_window(path: &Path, window: SavedWindow) -> std::io::Result<()> {
+    let mut cfg = load(path);
+    cfg.window = Some(window);
+    save(path, &cfg)
+}
+
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -141,6 +147,18 @@ mod tests {
         };
         save(&path, &cfg).unwrap();
         assert_eq!(load(&path), cfg);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn remember_window_keeps_the_file_key() {
+        let path = temp_path("remember");
+        save(&path, &Config { key: Some("filekey".into()), ..Config::default() }).unwrap();
+        let w = SavedWindow { x: 1.0, y: 2.0, width: 800.0, height: 500.0, maximized: false };
+        remember_window(&path, w).unwrap();
+        let loaded = load(&path);
+        assert_eq!(loaded.key.as_deref(), Some("filekey"));
+        assert_eq!(loaded.window, Some(w));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
