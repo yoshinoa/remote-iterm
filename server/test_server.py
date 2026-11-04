@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from server import server as server_module
@@ -295,6 +296,15 @@ class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
             self.session.notifications.put_nowait(None)
             await asyncio.sleep(self.INTERVAL * 1.5)
         self.assertGreaterEqual(self.sent[-1] - first, self.INTERVAL * 0.95)
+
+
+class GridFieldsTest(unittest.TestCase):
+    def test_reports_columns_and_rows(self):
+        session = SimpleNamespace(grid_size=SimpleNamespace(width=120, height=40))
+        self.assertEqual(server_module._grid_fields(session), {"columns": 120, "rows": 40})
+
+    def test_missing_grid_size_gives_nothing(self):
+        self.assertEqual(server_module._grid_fields(SimpleNamespace()), {})
 
 
 class InputValidationTest(unittest.TestCase):

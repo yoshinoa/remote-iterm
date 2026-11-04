@@ -633,6 +633,13 @@ def _content_line_range(
     return first, page_end - first, available_first, terminal_end
 
 
+def _grid_fields(session) -> dict:
+    size = getattr(session, "grid_size", None)
+    if size is None:
+        return {}
+    return {"columns": int(size.width), "rows": int(size.height)}
+
+
 async def read_content(
         session_id: str | None,
         line_count: int = LIVE_CONTENT_LINES,
@@ -657,6 +664,7 @@ async def read_content(
             mouse = {
                 "mouse": isinstance(mouse_mode, int) and mouse_mode >= 0,
                 "screenFirstLine": terminal_end - info.mutable_area_height,
+                **_grid_fields(session),
             }
             if count <= 0:
                 return {
