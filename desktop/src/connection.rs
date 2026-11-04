@@ -25,7 +25,8 @@ pub enum ServerEvent {
     History(SessionContent),
 }
 
-enum Command {
+#[derive(Debug)]
+pub(crate) enum Command {
     Emit { event: &'static str, data: Option<Value> },
     Ack { event: &'static str, data: Option<Value>, reply: oneshot::Sender<Option<Value>> },
     ReconnectNow,
@@ -289,6 +290,12 @@ async fn supervise(
 }
 
 impl ConnHandle {
+    #[cfg(test)]
+    pub(crate) fn recording() -> (ConnHandle, tmpsc::UnboundedReceiver<Command>) {
+        let (tx, rx) = tmpsc::unbounded_channel();
+        (ConnHandle { tx }, rx)
+    }
+
     fn emit(&self, event: &'static str, data: Option<Value>) {
         let _ = self.tx.send(Command::Emit { event, data });
     }
