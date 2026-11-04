@@ -1,17 +1,31 @@
 use crate::config::Config;
 use crate::connection::{self, ConnHandle, ServerEvent};
+use crate::geometry::{point_to_cell, selection_text};
 use crate::keys::{KeyInput, encode_key, paste_sequence};
+use crate::mouse::{MOTION, WHEEL_DOWN, WHEEL_UP, modifier_bits, sgr, terminal_row};
 use crate::model::{Effect, Model};
 use crate::prediction::{PredictKey, Predictor};
 use crate::ui::terminal::{TermStyle, compose_row, render_row};
 use crate::ui::theme;
 use futures::StreamExt;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use base64::Engine;
 use gpui::{
-    ClipboardEntry, Context, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
+    Bounds, ClipboardEntry, DispatchPhase, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollDelta, ScrollWheelEvent, canvas, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+type Cellpos = (i64, usize);
+
+struct Drag {
+    mods: u8,
+    last: (u32, u32),
+    count: Shared<BoxFuture<'static, Option<i64>>>,
+}
 
 pub struct RootView {
     pub(crate) model: Model,
@@ -24,6 +38,12 @@ pub struct RootView {
     pub(crate) connected: bool,
     pub(crate) ever_connected: bool,
     pub(crate) auth_rejected: bool,
+    pub(crate) term_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub(crate) selection: Option<(Cellpos, Cellpos)>,
+    selecting: bool,
+    drag: Option<Drag>,
+    history_pending: Option<i64>,
+    wheel_accum: f32,
     events_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
 }
@@ -49,6 +69,12 @@ impl RootView {
             connected: false,
             ever_connected: false,
             auth_rejected: false,
+            term_bounds: Rc::new(Cell::new(None)),
+            selection: None,
+            selecting: false,
+            drag: None,
+            history_pending: None,
+            wheel_accum: 0.0,
             events_task: None,
             tick_task: None,
         };
@@ -143,7 +169,20 @@ impl RootView {
                 }
             }
             ServerEvent::History(content) => {
-                self.model.apply_history(content);
+                let session = content.session_id.clone();
+                let before = self.model.shown().map(|c| c.first_line);
+                if self.model.apply_history(content) {
+                    self.history_pending = None;
+                    let after = self.model.shown().map(|c| c.first_line);
+                    if let (Some(before), Some(after)) = (before, after) {
+                        let added = usize::try_from(before - after).unwrap_or(0);
+                        if added > 0 {
+                            let top = self.scroll.logical_scroll_top_index();
+                            self.scroll.scroll_to_item(top + added, ScrollStrategy::Top);
+                        }
+                    }
+                }
+                let _ = session;
             }
         }
         cx.notify();
@@ -187,6 +226,7 @@ impl RootView {
         if let Some(conn) = &self.conn {
             conn.send_keys(&session, keys);
         }
+        self.selection = None;
         match (predict, self.model.shown()) {
             (Some(key), Some(screen)) => self.predictor.on_key(&session, key, screen, Instant::now()),
             _ => self.predictor.reset(),
@@ -245,10 +285,207 @@ impl RootView {
         }
     }
 
+    fn send_raw(&mut self, keys: &str) {
+        let Some(session) = self.model.session_id.clone() else {
+            return;
+        };
+        if let Some(conn) = &self.conn {
+            conn.send_keys(&session, keys);
+        }
+        self.predictor.reset();
+    }
+
+    fn cell_at(&self, position: Point<Pixels>) -> Option<Cellpos> {
+        let bounds = self.term_bounds.get()?;
+        let content = self.model.shown()?;
+        let scroll_top = -self.scroll.0.borrow().base_handle.offset().y;
+        Some(point_to_cell(
+            f32::from(position.x - bounds.origin.x),
+            f32::from(position.y - bounds.origin.y),
+            f32::from(self.cell_width),
+            theme::LINE_HEIGHT,
+            f32::from(scroll_top),
+            content.first_line,
+        ))
+    }
+
+    fn report_cell(&self, cell: Cellpos) -> Option<(u32, u32)> {
+        let content = self.model.shown()?;
+        let screen_first = content.screen_first_line.unwrap_or(content.first_line);
+        Some((u32::try_from(cell.1 + 1).ok()?, terminal_row(cell.0, screen_first)))
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let (Some((a, b)), Some(content)) = (self.selection, self.model.shown()) else {
+            return false;
+        };
+        let text = selection_text(content, a, b);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        let Some(cell) = self.cell_at(event.position) else {
+            return;
+        };
+        let Some(content) = self.model.shown() else {
+            return;
+        };
+        if content.mouse {
+            let Some(at) = self.report_cell(cell) else {
+                return;
+            };
+            let mods = modifier_bits(event.modifiers.shift, event.modifiers.control);
+            let count = match self.conn.clone() {
+                Some(conn) => async move { conn.clipboard_count().await }.boxed().shared(),
+                None => async { None }.boxed().shared(),
+            };
+            let driver = count.clone();
+            cx.spawn(async move |_, _| {
+                driver.await;
+            })
+            .detach();
+            self.send_raw(&sgr(mods, at.0, at.1, false));
+            self.drag = Some(Drag { mods, last: at, count });
+            return;
+        }
+        if event.modifiers.control {
+            if let Some(url) = content.link_at(cell.0, cell.1) {
+                cx.open_url(&url);
+                return;
+            }
+        }
+        self.selection = Some((cell, cell));
+        self.selecting = true;
+        cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        let Some(cell) = self.cell_at(event.position) else {
+            return;
+        };
+        if let Some(drag) = &self.drag {
+            let Some(at) = self.report_cell(cell) else {
+                return;
+            };
+            if at != drag.last {
+                let code = MOTION | drag.mods;
+                self.send_raw(&sgr(code, at.0, at.1, false));
+                if let Some(drag) = &mut self.drag {
+                    drag.last = at;
+                }
+            }
+            return;
+        }
+        if self.selecting {
+            if let Some((anchor, _)) = self.selection {
+                self.selection = Some((anchor, cell));
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(drag) = self.drag.take() {
+            let at = self.cell_at(event.position).and_then(|c| self.report_cell(c)).unwrap_or(drag.last);
+            self.send_raw(&sgr(drag.mods, at.0, at.1, true));
+            let Some(conn) = self.conn.clone() else {
+                return;
+            };
+            let count = drag.count;
+            cx.spawn(async move |_, cx| {
+                let Some(count) = count.await else {
+                    return;
+                };
+                let Some(text) = conn.clipboard_since(count).await.filter(|t| !t.is_empty()) else {
+                    return;
+                };
+                let _ = cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+            })
+            .detach();
+            return;
+        }
+        if self.selecting {
+            self.selecting = false;
+            if let Some((a, b)) = self.selection {
+                if a == b {
+                    self.selection = None;
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    fn at_top(&self) -> bool {
+        self.scroll.0.borrow().base_handle.offset().y >= px(-1.0)
+    }
+
+    fn wheel_lines(event: &ScrollWheelEvent) -> f32 {
+        match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / theme::LINE_HEIGHT,
+        }
+    }
+
+    fn forward_wheel(&mut self, event: &ScrollWheelEvent) -> bool {
+        if !self.model.shown().is_some_and(|c| c.mouse) {
+            return false;
+        }
+        let Some(at) = self.cell_at(event.position).and_then(|c| self.report_cell(c)) else {
+            return true;
+        };
+        self.wheel_accum += Self::wheel_lines(event);
+        while self.wheel_accum >= 1.0 {
+            self.wheel_accum -= 1.0;
+            self.send_raw(&sgr(WHEEL_UP, at.0, at.1, false));
+        }
+        while self.wheel_accum <= -1.0 {
+            self.wheel_accum += 1.0;
+            self.send_raw(&sgr(WHEEL_DOWN, at.0, at.1, false));
+        }
+        true
+    }
+
+    fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(content) = self.model.shown() else {
+            return;
+        };
+        if content.mouse {
+            return;
+        }
+        if Self::wheel_lines(event) > 0.0
+            && self.at_top()
+            && content.first_line > content.available_first_line
+            && self.history_pending.is_none()
+        {
+            let first = content.first_line;
+            if let (Some(conn), Some(session)) = (&self.conn, &self.model.session_id) {
+                conn.get_earlier(session, first);
+                self.history_pending = Some(first);
+            }
+        }
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let m = keystroke.modifiers;
         let plain_ctrl = m.control && !m.alt && !m.platform && !m.shift;
+        if m.control && m.shift && !m.alt && !m.platform && keystroke.key == "c" {
+            self.copy_selection(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if plain_ctrl && keystroke.key == "c" && self.copy_selection(cx) {
+            self.selection = None;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if plain_ctrl {
             if let Some(n) = keystroke.key.parse::<u8>().ok().filter(|n| (1..=9).contains(n)) {
                 let effects = self.model.select_tab_number(n);
@@ -341,6 +578,8 @@ impl RootView {
         let fg = theme::parse_hex(&content.fg).unwrap_or(theme::color(theme::TEXT));
         let bg = theme::parse_hex(&content.bg).unwrap_or(theme::color(theme::BACKGROUND));
         let count = content.lines.len();
+        let bounds_cell = self.term_bounds.clone();
+        let weak = cx.entity().downgrade();
         div()
             .flex_1()
             .min_h_0()
@@ -351,6 +590,39 @@ impl RootView {
             .line_height(px(theme::LINE_HEIGHT))
             .text_color(fg)
             .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    .child(
+                        canvas(
+                            move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                            move |bounds, _, window, _| {
+                                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+                                    if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
+                                        return;
+                                    }
+                                    if weak.update(cx, |view, cx| {
+                                        let handled = view.forward_wheel(event);
+                                        if handled {
+                                            cx.notify();
+                                        }
+                                        handled
+                                    })
+                                    .unwrap_or(false)
+                                    {
+                                        cx.stop_propagation();
+                                    }
+                                });
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(
                 uniform_list(
                     "terminal",
                     count,
@@ -362,7 +634,9 @@ impl RootView {
                             fg: theme::parse_hex(&content.fg).unwrap_or(theme::color(theme::TEXT)),
                             cell_width: view.cell_width,
                             cursor: theme::color(theme::ACCENT),
+                            selection: theme::color(theme::SELECTION),
                         };
+                        let selection = view.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
                         let overlay = view.predictor.overlay();
                         let predicted_cursor = view.predictor.cursor();
                         range
@@ -376,13 +650,23 @@ impl RootView {
                                     Some((l, col)) => (l == line).then_some(col),
                                     None => real_cursor,
                                 };
-                                Some(render_row(&row, cursor, &style))
+                                let highlight = selection.and_then(|(a, b)| {
+                                    if line < a.0 || line > b.0 {
+                                        return None;
+                                    }
+                                    let from = if line == a.0 { a.1 } else { 0 };
+                                    let to = if line == b.0 { b.1 } else { usize::MAX / 2 };
+                                    let width = row.iter().map(|r| r.t.chars().count()).sum::<usize>();
+                                    Some((from, to.min(width.max(from))))
+                                });
+                                Some(render_row(&row, cursor, highlight, &style))
                             })
                             .collect()
                     }),
                 )
                 .track_scroll(self.scroll.clone())
-                .h_full(),
+                .size_full(),
+                    ),
             )
             .into_any_element()
     }

@@ -7,6 +7,7 @@ pub const ACCENT: u32 = 0x10b981;
 pub const TEXT: u32 = 0xd4d4d8;
 pub const MUTED: u32 = 0x71717a;
 pub const DANGER: u32 = 0xfb7185;
+pub const SELECTION: u32 = 0x1e3a8a;
 pub const FONT_SIZE: f32 = 13.0;
 pub const LINE_HEIGHT: f32 = 17.0;
 pub const TEXT_PADDING: f32 = 8.0;

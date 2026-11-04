@@ -6,9 +6,10 @@ pub struct TermStyle {
     pub fg: Hsla,
     pub cell_width: Pixels,
     pub cursor: Hsla,
+    pub selection: Hsla,
 }
 
-pub fn render_row(runs: &[Run], cursor_col: Option<usize>, style: &TermStyle) -> Div {
+pub fn render_row(runs: &[Run], cursor_col: Option<usize>, highlight: Option<(usize, usize)>, style: &TermStyle) -> Div {
     let text: String = runs.iter().map(|r| r.t.as_str()).collect();
     let text_runs: Vec<TextRun> = runs
         .iter()
@@ -32,6 +33,17 @@ pub fn render_row(runs: &[Run], cursor_col: Option<usize>, style: &TermStyle) ->
         .w_full()
         .whitespace_nowrap()
         .overflow_hidden();
+    if let Some((from, to)) = highlight.filter(|(from, to)| to > from) {
+        row = row.child(
+            div()
+                .absolute()
+                .top_0()
+                .left(style.cell_width * from as f32)
+                .w(style.cell_width * (to - from) as f32)
+                .h(px(theme::LINE_HEIGHT))
+                .bg(style.selection),
+        );
+    }
     if let Some(col) = cursor_col {
         row = row.child(
             div()

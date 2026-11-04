@@ -114,6 +114,18 @@ impl Content {
         None
     }
 
+    pub fn link_at(&self, line: i64, col: usize) -> Option<String> {
+        let mut remaining = col;
+        for run in self.line(line)? {
+            let len = run.t.chars().count();
+            if remaining < len {
+                return run.u.clone();
+            }
+            remaining -= len;
+        }
+        None
+    }
+
     pub fn line_text(&self, line: i64) -> Option<String> {
         Some(self.line(line)?.iter().map(|r| r.t.as_str()).collect())
     }
@@ -263,6 +275,16 @@ mod tests {
         assert_eq!(c.cell(10, 9), None);
         assert_eq!(c.cell(11, 0), None);
         assert_eq!(c.line_text(10).as_deref(), Some("❯ fix"));
+    }
+
+    #[test]
+    fn link_at_finds_the_run_url_under_a_cell() {
+        let link = Run { t: "docs".into(), u: Some("https://example.com/docs".into()), ..Run::default() };
+        let c = content(5, vec![vec![run("see "), link, run(" now")]], true, 6);
+        assert_eq!(c.link_at(5, 4).as_deref(), Some("https://example.com/docs"));
+        assert_eq!(c.link_at(5, 7).as_deref(), Some("https://example.com/docs"));
+        assert_eq!(c.link_at(5, 8), None);
+        assert_eq!(c.link_at(5, 0), None);
     }
 
     #[test]
