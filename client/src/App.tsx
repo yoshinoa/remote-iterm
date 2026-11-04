@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon, KeyRound } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, ClipboardCheck, ClipboardCopy, ClipboardX, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon, KeyRound } from 'lucide-react';
 
 // --- Types ---
 interface PaneRect { x: number; y: number; w: number; h: number; }
@@ -10,9 +10,9 @@ interface Bounds { x: number; y: number; w: number; h: number; }
 interface WindowState { id: string; isFront: boolean; tabs: Tab[]; bounds?: Bounds; }
 interface ScreenSize { width: number; height: number; }
 
-// A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold, d=dim.
+// A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold, d=dim, u=link.
 // f/g omitted means "use the pane default" (theme fg/bg).
-interface Run { t: string; f?: string; g?: string; b?: boolean; d?: boolean; c?: boolean }
+interface Run { t: string; f?: string; g?: string; b?: boolean; d?: boolean; c?: boolean; u?: string }
 interface StyledContent {
   lines: Run[][];
   fg: string;
@@ -21,6 +21,8 @@ interface StyledContent {
   availableFirstLine: number;
   terminalEnd: number;
   isLatest: boolean;
+  mouse?: boolean;
+  screenFirstLine?: number;
 }
 
 const ACCENT = '#10b981';
@@ -100,7 +102,73 @@ function mergeStyledContent(current: StyledContent | undefined, incoming: Styled
     availableFirstLine: incoming.availableFirstLine,
     terminalEnd: incoming.terminalEnd,
     isLatest: current.isLatest || incoming.isLatest,
+    mouse: incoming.mouse,
+    screenFirstLine: incoming.screenFirstLine,
   };
+}
+
+const PLAIN_PASTE_MAX_BYTES = 512;
+
+function pasteSequence(text: string): string {
+  if (!/[\r\n]/.test(text) && new TextEncoder().encode(text).length <= PLAIN_PASTE_MAX_BYTES) return text;
+  return `\x1b[200~${text.replace(/\x1b/g, '').replace(/\r\n?/g, '\n')}\x1b[201~`;
+}
+
+type CaretDocument = {
+  caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+  caretRangeFromPoint?: (x: number, y: number) => Range | null;
+};
+
+function caretFromPoint(x: number, y: number): { node: Node; offset: number } | null {
+  const doc = document as unknown as CaretDocument;
+  if (doc.caretPositionFromPoint) {
+    const pos = doc.caretPositionFromPoint(x, y);
+    return pos ? { node: pos.offsetNode, offset: pos.offset } : null;
+  }
+  const range = doc.caretRangeFromPoint?.(x, y);
+  return range ? { node: range.startContainer, offset: range.startOffset } : null;
+}
+
+function terminalCellFromPoint(pre: HTMLElement, x: number, y: number): { line: number; col: number } | null {
+  const rect = pre.getBoundingClientRect();
+  const caret = caretFromPoint(
+    Math.min(Math.max(x, rect.left + 1), rect.right - 1),
+    Math.min(Math.max(y, rect.top + 1), rect.bottom - 1),
+  );
+  if (!caret || !pre.contains(caret.node) || caret.node === pre) return null;
+  let lineEl = caret.node.nodeType === Node.ELEMENT_NODE ? caret.node as Element : caret.node.parentElement;
+  while (lineEl && lineEl.parentElement !== pre) lineEl = lineEl.parentElement;
+  if (!lineEl) return null;
+  const range = document.createRange();
+  range.setStart(lineEl, 0);
+  range.setEnd(caret.node, caret.offset);
+  const before = range.cloneContents();
+  before.querySelectorAll('.cursor-cell').forEach((cursor) => cursor.remove());
+  const text = (before.textContent ?? '').replace(/\n$/, '');
+  return { line: Array.prototype.indexOf.call(pre.children, lineEl), col: Array.from(text).length };
+}
+
+let cellWidthCache: { font: string; width: number } | undefined;
+
+function terminalCellWidth(style: CSSStyleDeclaration): number {
+  const font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+  if (cellWidthCache?.font !== font) {
+    const context = document.createElement('canvas').getContext('2d');
+    if (!context) return 0;
+    context.font = font;
+    cellWidthCache = { font, width: context.measureText('M').width };
+  }
+  return cellWidthCache.width;
+}
+
+function terminalCellUnderPointer(pre: HTMLElement, x: number, y: number): { line: number; col: number } | null {
+  const cell = terminalCellFromPoint(pre, x, y);
+  if (!cell) return null;
+  const style = getComputedStyle(pre);
+  const width = terminalCellWidth(style);
+  if (!width) return cell;
+  const left = pre.getBoundingClientRect().left + parseFloat(style.paddingLeft);
+  return { line: cell.line, col: Math.max(0, Math.floor((x - left) / width)) };
 }
 
 function loadHistory(): string[] {
@@ -159,6 +227,10 @@ export default function App() {
   // Bumped to re-render the pane map's content thumbnails when cached pane
   // content arrives (cache lives in a ref, so it can't trigger renders itself).
   const [, setPreviewTick] = useState(0);
+  const [macClipStatus, setMacClipStatus] = useState<'ok' | 'empty' | null>(null);
+  const [macClipText, setMacClipText] = useState<string | null>(null);
+  const macClipTimerRef = useRef<number | undefined>(undefined);
+  const macClipTextRef = useRef<HTMLTextAreaElement | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const captureRef = useRef<HTMLTextAreaElement | null>(null);
   const lastScrollFwdRef = useRef(0);
@@ -292,6 +364,8 @@ export default function App() {
         availableFirstLine: data.availableFirstLine,
         terminalEnd: data.terminalEnd,
         isLatest: data.isLatest,
+        mouse: data.mouse,
+        screenFirstLine: data.screenFirstLine,
       };
       if (data.sessionId) {
         const merged = mergeStyledContent(contentCacheRef.current.get(data.sessionId), styled);
@@ -654,6 +728,7 @@ export default function App() {
   const handleTerminalWheel = (
     e: React.WheelEvent<HTMLDivElement>,
     atBottomRef: React.MutableRefObject<boolean>,
+    styled: StyledContent | null,
   ) => {
     const el = e.currentTarget;
     const atTop = el.scrollTop <= 0;
@@ -663,12 +738,60 @@ export default function App() {
       const now = performance.now();
       if (now - lastScrollFwdRef.current < 40) return;
       lastScrollFwdRef.current = now;
+      const pre = el.querySelector('pre');
+      const cell = pre && styled && terminalCellUnderPointer(pre, e.clientX, e.clientY);
+      const col = cell ? cell.col + 1 : 1;
+      const row = cell ? Math.max(1, cell.line + styled.firstLine - (styled.screenFirstLine ?? styled.firstLine) + 1) : 1;
       // Repeat the wheel event `scrollLines` times so one wheel notch moves the
       // user's configured number of lines.
-      sendSpecialKey((e.deltaY < 0 ? '\x1b[<64;1;1M' : '\x1b[<65;1;1M').repeat(scrollLines));
+      sendSpecialKey(`\x1b[<${e.deltaY < 0 ? 64 : 65};${col};${row}M`.repeat(scrollLines));
       return;
     }
     if (e.deltaY < 0) atBottomRef.current = false;
+  };
+
+  const handleTerminalMouseDown = (
+    e: React.MouseEvent<HTMLPreElement>,
+    styled: StyledContent | null,
+    sessionId: string | null,
+  ) => {
+    const socket = socketRef.current;
+    if (!isDesktop || e.button !== 0 || e.altKey || !styled?.mouse || !sessionId || !socket) return;
+    if ((e.target as Element).closest('a[href]')) return;
+    const pre = e.currentTarget;
+    const rowOffset = styled.firstLine - (styled.screenFirstLine ?? styled.firstLine) + 1;
+    const cellAt = (x: number, y: number) => {
+      const cell = terminalCellFromPoint(pre, x, y);
+      return cell && { col: cell.col + 1, row: Math.max(1, cell.line + rowOffset) };
+    };
+    const start = cellAt(e.clientX, e.clientY);
+    if (!start) return;
+    e.preventDefault();
+    const modifiers = (ev: { shiftKey: boolean; ctrlKey: boolean }) => (ev.shiftKey ? 4 : 0) | (ev.ctrlKey ? 16 : 0);
+    const send = (code: number, cell: { col: number; row: number }, final: 'M' | 'm') =>
+      socket.emit('sendKeys', { sessionId, keys: `\x1b[<${code};${cell.col};${cell.row}${final}` });
+    const clipboardCount = socket.timeout(5000).emitWithAck('clipboardCount').catch(() => null);
+    send(modifiers(e), start, 'M');
+    let last = start;
+    const onMove = (ev: MouseEvent) => {
+      const cell = cellAt(ev.clientX, ev.clientY);
+      if (!cell || (cell.col === last.col && cell.row === last.row)) return;
+      last = cell;
+      send(32 | modifiers(ev), cell, 'M');
+    };
+    const onUp = async (ev: MouseEvent) => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      send(modifiers(ev), cellAt(ev.clientX, ev.clientY) ?? last, 'm');
+      try {
+        const count = await clipboardCount;
+        if (typeof count !== 'number') return;
+        const text = await socket.timeout(5000).emitWithAck('clipboardSince', { count });
+        if (typeof text === 'string' && text) await navigator.clipboard.writeText(text);
+      } catch {}
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
   };
 
   const changeScrollLines = (delta: number) => setScrollLines((n) => {
@@ -680,8 +803,47 @@ export default function App() {
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText();
-      if (text) socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys: text });
+      if (text) socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys: pasteSequence(text) });
     } catch {}
+  };
+
+  const flashMacClip = (status: 'ok' | 'empty') => {
+    setMacClipStatus(status);
+    window.clearTimeout(macClipTimerRef.current);
+    macClipTimerRef.current = window.setTimeout(() => setMacClipStatus(null), 1500);
+  };
+
+  const handleCopyMacClipboard = async () => {
+    const socket = socketRef.current;
+    if (!socket) return;
+    const text: Promise<string> = socket.timeout(5000).emitWithAck('clipboardText')
+      .then((t: unknown) => (typeof t === 'string' ? t : ''));
+    try {
+      await navigator.clipboard.write([new ClipboardItem({
+        'text/plain': text.then((t) => (t ? new Blob([t], { type: 'text/plain' }) : Promise.reject(new Error('empty')))),
+      })]);
+      return flashMacClip('ok');
+    } catch {}
+    const value = await text.catch(() => '');
+    if (!value) return flashMacClip('empty');
+    try {
+      await navigator.clipboard.writeText(value);
+      flashMacClip('ok');
+    } catch {
+      setMacClipText(value);
+    }
+  };
+
+  const copyMacClipFallback = () => {
+    const ta = macClipTextRef.current;
+    if (!ta) return;
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    if (document.execCommand('copy')) {
+      setMacClipText(null);
+      flashMacClip('ok');
+    }
   };
 
   // Desktop raw-typing keeps a hidden textarea (captureRef) focused: a focused
@@ -689,7 +851,7 @@ export default function App() {
   // over plain HTTP. Refocus it on window focus and on click, unless the user
   // is selecting terminal text to copy.
   useEffect(() => {
-    if (!isDesktop || !connected) return;
+    if (!isDesktop || !connected || macClipText !== null) return;
     const focusCapture = () => {
       if (window.getSelection()?.toString()) return;
       captureRef.current?.focus();
@@ -701,7 +863,7 @@ export default function App() {
       window.removeEventListener('focus', focusCapture);
       document.removeEventListener('click', focusCapture);
     };
-  }, [isDesktop, connected]);
+  }, [isDesktop, connected, macClipText]);
 
   const handleCaptureKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (showMap || showSplitMap || showPaneMap || tabListTarget) return;
@@ -739,7 +901,7 @@ export default function App() {
     const text = data.getData('text');
     if (text) {
       e.preventDefault();
-      sendSpecialKey(text);
+      sendSpecialKey(pasteSequence(text));
     }
   };
 
@@ -1283,7 +1445,7 @@ export default function App() {
           )}
           <div
             ref={contentRef}
-            onWheel={(event) => handleTerminalWheel(event, primaryAtBottomRef)}
+            onWheel={(event) => handleTerminalWheel(event, primaryAtBottomRef, content)}
             onScroll={(event) => {
               primaryAtBottomRef.current = isScrolledToBottom(event.currentTarget);
               loadEarlierContent('primary', selectedSessionId, content, event.currentTarget);
@@ -1291,7 +1453,7 @@ export default function App() {
             className="flex-1 overflow-auto relative min-h-0 min-w-0"
           >
             {content && content.lines.length ? (
-              <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full select-text cursor-text" style={{ color: content.fg, backgroundColor: content.bg }}>
+              <pre onMouseDown={(event) => handleTerminalMouseDown(event, content, selectedSessionId)} className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full select-text cursor-text" style={{ color: content.fg, backgroundColor: content.bg }}>
                 {content.lines.map((runs, i) => (
                   <span key={i}>
                     {runs.map((r, j) => (
@@ -1300,9 +1462,7 @@ export default function App() {
                           <span key={j} className="cursor-blink cursor-cell" style={{ color: ACCENT }} aria-hidden="true">█</span>
                         )
                       ) : (
-                        <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, opacity: r.d ? 0.55 : 1, ...(r.g ? { backgroundColor: r.g } : null) }}>
-                          {r.t}
-                        </span>
+                        <TerminalRun key={j} run={r} />
                       )
                     ))}
                     {i < content.lines.length - 1 ? '\n' : ''}
@@ -1409,7 +1569,7 @@ export default function App() {
             </div>
             <div
               ref={splitContentRef}
-              onWheel={(event) => handleTerminalWheel(event, splitAtBottomRef)}
+              onWheel={(event) => handleTerminalWheel(event, splitAtBottomRef, splitContent)}
               onScroll={(event) => {
                 splitAtBottomRef.current = isScrolledToBottom(event.currentTarget);
                 loadEarlierContent('split', splitSessionId, splitContent, event.currentTarget);
@@ -1418,7 +1578,7 @@ export default function App() {
               style={{ borderLeft: `3px solid ${focusedPane === 'split' ? '#38bdf8' : '#38bdf830'}` }}
             >
               {splitContent && splitContent.lines.length ? (
-                <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full select-text cursor-text" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
+                <pre onMouseDown={(event) => handleTerminalMouseDown(event, splitContent, splitSessionId)} className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full select-text cursor-text" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
                   {splitContent.lines.map((runs, i) => (
                     <span key={i}>
                       {runs.map((r, j) => (
@@ -1427,9 +1587,7 @@ export default function App() {
                             <span key={j} className="cursor-blink cursor-cell" style={{ color: '#38bdf8' }} aria-hidden="true">█</span>
                           )
                         ) : (
-                          <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, opacity: r.d ? 0.55 : 1, ...(r.g ? { backgroundColor: r.g } : null) }}>
-                            {r.t}
-                          </span>
+                          <TerminalRun key={j} run={r} />
                         )
                       ))}
                       {i < splitContent.lines.length - 1 ? '\n' : ''}
@@ -1472,6 +1630,45 @@ export default function App() {
         />
       )}
 
+      {macClipText !== null && (
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center px-5"
+          style={{ backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)' }}
+          onClick={() => setMacClipText(null)}
+        >
+          <div
+            className="w-full max-w-lg rounded-xl border border-zinc-800 bg-[#111113] p-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-1 text-[11px] font-bold tracking-[0.14em] text-zinc-300">MAC CLIPBOARD</div>
+            <div className="mb-3 text-[10px] text-zinc-600">This browser blocked direct clipboard access. Tap Copy, or select the text yourself.</div>
+            <textarea
+              ref={macClipTextRef}
+              readOnly
+              autoFocus
+              value={macClipText}
+              onFocus={(e) => e.currentTarget.select()}
+              onKeyDown={(e) => { if (e.key === 'Escape') setMacClipText(null); }}
+              className="h-48 w-full resize-none rounded-lg border border-zinc-700 bg-zinc-950 p-2 text-[12px] text-zinc-200 outline-none select-text"
+            />
+            <div className="mt-3 flex gap-2">
+              <button
+                onClick={copyMacClipFallback}
+                className="h-10 flex-1 rounded-lg bg-emerald-500 text-[11px] font-bold tracking-[0.14em] text-black"
+              >
+                COPY
+              </button>
+              <button
+                onClick={() => setMacClipText(null)}
+                className="h-10 flex-1 rounded-lg border border-zinc-700 text-[11px] font-bold tracking-[0.14em] text-zinc-400"
+              >
+                CLOSE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Quick Actions ── */}
       <div className={`flex items-center gap-1.5 bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 overflow-x-auto no-scrollbar ${isLandscape ? 'px-2 py-1' : 'px-3 py-2'}`}>
         <QuickBtn label="ESC" onClick={() => sendSpecialKey('\x1b')} color="#f87171" />
@@ -1493,6 +1690,14 @@ export default function App() {
         <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
         <QuickBtn icon={<Clipboard className="w-3.5 h-3.5" />} onClick={handlePaste} color="#38bdf8" />
         <QuickBtn icon={<Copy className="w-3.5 h-3.5" />} onClick={handleCopy} color="#71717a" />
+        <QuickBtn
+          icon={macClipStatus === 'ok' ? <ClipboardCheck className="w-3.5 h-3.5" />
+            : macClipStatus === 'empty' ? <ClipboardX className="w-3.5 h-3.5" />
+            : <ClipboardCopy className="w-3.5 h-3.5" />}
+          onClick={handleCopyMacClipboard}
+          color={macClipStatus === 'ok' ? '#34d399' : macClipStatus === 'empty' ? '#fb7185' : '#e879f9'}
+          title="Copy the Mac clipboard to this device"
+        />
         <QuickBtn icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x15')} color="#fb7185" />
         {isDesktop && (
           <>
@@ -1659,6 +1864,18 @@ function TabListOverlay({ tabs, selectedId, accent, onSelect, onClose }: {
   );
 }
 
+const OPENABLE_LINK = /^(https?:\/\/|mailto:)/i;
+
+function TerminalRun({ run }: { run: Run }) {
+  const style = { color: run.f, fontWeight: run.b ? 600 : 400, opacity: run.d ? 0.55 : 1, ...(run.g ? { backgroundColor: run.g } : null) };
+  if (!run.u || !OPENABLE_LINK.test(run.u)) return <span style={style}>{run.t}</span>;
+  return (
+    <a href={run.u} target="_blank" rel="noopener noreferrer" draggable={false} title={run.u} className="cursor-pointer hover:underline" style={style}>
+      {run.t}
+    </a>
+  );
+}
+
 // --- Tiny terminal thumbnail shown inside each pane-map cell ---
 // Renders the tail of a pane's cached content in miniature, faithful colors.
 const PanePreview = memo(function PanePreview({ content }: { content?: StyledContent }) {
@@ -1728,16 +1945,18 @@ function PaneSwitcher({ panes, selectedId, onSelect, onOpenMap }: {
 }
 
 // --- Quick Action Button ---
-function QuickBtn({ label, icon, onClick, color, active }: {
+function QuickBtn({ label, icon, onClick, color, active, title }: {
   label?: string;
   icon?: React.ReactNode;
   onClick: () => void;
   color: string;
   active?: boolean;
+  title?: string;
 }) {
   return (
     <button
       onClick={onClick}
+      title={title}
       className="flex items-center justify-center min-w-[40px] h-[36px] px-2.5 rounded-lg border transition-all active:scale-90 flex-shrink-0"
       style={{
         borderColor: active ? color : color + '30',
@@ -1808,7 +2027,7 @@ function encodeKeyEvent(e: {
   };
 
   switch (key) {
-    case 'Enter': return '\r';
+    case 'Enter': return shiftKey ? '\n' : '\r';
     case 'Backspace': return '\x7f';
     case 'Tab': return shiftKey ? '\x1b[Z' : '\t';
     case 'Escape': return '\x1b';

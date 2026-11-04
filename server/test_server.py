@@ -9,6 +9,7 @@ from server.server import (
     _content_line_range,
     _image_uti,
     _line_runs,
+    _wrapped_links,
     _valid_input,
     client_origins,
     decode_image_payload,
@@ -20,6 +21,7 @@ from server.server import (
     queue_client_event,
     queue_content_for_watchers,
     resolve_session,
+    wait_for_clipboard_change,
     watched_by_sid,
 )
 
@@ -29,20 +31,29 @@ class _DefaultColor:
     is_standard = False
 
 
+class _Url:
+    def __init__(self, url):
+        self.url = url
+
+
 class _Style:
-    def __init__(self, *, faint=False):
+    def __init__(self, *, faint=False, url=None):
         self.fg_color = _DefaultColor()
         self.bg_color = _DefaultColor()
         self.bold = False
         self.faint = faint
         self.inverse = False
+        self.url = _Url(url) if url else None
 
 
 class _Line:
-    def __init__(self, text, faint_at=()):
+    def __init__(self, text, faint_at=(), url_at=None, hard_eol=True):
         self.text = text
+        self.hard_eol = hard_eol
         faint_at = set(faint_at)
-        self.styles = [_Style(faint=i in faint_at) for i in range(len(text))]
+        url_at = url_at or {}
+        self.styles = [_Style(faint=i in faint_at, url=url_at.get(i))
+                       for i in range(len(text))]
 
     def style_at(self, index):
         return self.styles[index] if index < len(self.styles) else None
@@ -70,6 +81,50 @@ class LineRunsTest(unittest.TestCase):
             [{"t": "a"}, {"t": "b", "d": True}],
         )
 
+    def test_carries_osc8_hyperlinks(self):
+        url = "https://example.com/ad?id=5"
+        self.assertEqual(
+            _line_runs(_Line("see Preview", url_at={i: url for i in range(4, 11)}),
+                       _DEFAULT_PALETTE),
+            [{"t": "see "}, {"t": "Preview", "u": url}],
+        )
+
+    def test_links_bare_urls_without_trailing_punctuation(self):
+        self.assertEqual(
+            _line_runs(_Line("open http://localhost:5173/a. now"), _DEFAULT_PALETTE),
+            [{"t": "open "},
+             {"t": "http://localhost:5173/a", "u": "http://localhost:5173/a"},
+             {"t": ". now"}],
+        )
+
+    def test_drops_hyperlinks_a_browser_cannot_open(self):
+        self.assertEqual(
+            _line_runs(_Line("img", url_at={i: "file:///tmp/a.png" for i in range(3)}),
+                       _DEFAULT_PALETTE),
+            [{"t": "img"}],
+        )
+
+
+class WrappedLinksTest(unittest.TestCase):
+    def _render(self, lines):
+        return [_line_runs(line, _DEFAULT_PALETTE, links=links)
+                for line, links in zip(lines, _wrapped_links(lines))]
+
+    def test_links_a_soft_wrapped_url_to_its_full_target(self):
+        url = "https://example.com/oauth?code=abc"
+        lines = [_Line("go " + url[:12], hard_eol=False), _Line(url[12:] + " ok")]
+        self.assertEqual(self._render(lines), [
+            [{"t": "go "}, {"t": url[:12], "u": url}],
+            [{"t": url[12:], "u": url}, {"t": " ok"}],
+        ])
+
+    def test_does_not_join_across_hard_newlines(self):
+        lines = [_Line("https://a.com/x"), _Line("yz")]
+        self.assertEqual(self._render(lines), [
+            [{"t": "https://a.com/x", "u": "https://a.com/x"}],
+            [{"t": "yz"}],
+        ])
+
 
 class ContentLineRangeTest(unittest.TestCase):
     def test_returns_latest_bounded_page(self):
@@ -92,6 +147,17 @@ class ContentLineRangeTest(unittest.TestCase):
         self.assertEqual(
             _content_line_range(Info(), 500, before_line=600),
             (275, 325, 275, 10_315),
+        )
+
+    def test_alternate_screen_exposes_only_the_screen(self):
+        class Info:
+            overflow = 275
+            scrollback_buffer_height = 10_000
+            mutable_area_height = 40
+
+        self.assertEqual(
+            _content_line_range(Info(), 250, alternate_screen=True),
+            (10_275, 40, 10_275, 10_315),
         )
 
 
@@ -123,6 +189,87 @@ class BoundedDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(pending_events["watching"]), 1)
         self.assertEqual(pending_events["other"], {})
+
+
+class _FakeStreamer:
+    def __init__(self, notifications: asyncio.Queue):
+        self.notifications = notifications
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def async_get(self):
+        return await self.notifications.get()
+
+
+class _FakeStreamSession:
+    def __init__(self):
+        self.notifications = asyncio.Queue()
+
+    def get_screen_streamer(self, want_contents=False):
+        return _FakeStreamer(self.notifications)
+
+
+class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
+    INTERVAL = 0.2
+
+    async def asyncSetUp(self):
+        self.session = _FakeStreamSession()
+        self.sent: list[float] = []
+        self.reads = 0
+        loop = asyncio.get_running_loop()
+
+        async def fake_read_content(session_id):
+            self.reads += 1
+            return {"lines": [[{"t": str(self.reads)}]]}
+
+        app = mock.Mock()
+        app.get_session_by_id.return_value = self.session
+        clients.add("watching")
+        self.patches = [
+            mock.patch.object(server_module, "itermapp", app),
+            mock.patch.object(server_module, "read_content", fake_read_content),
+            mock.patch.object(server_module, "queue_content_for_watchers",
+                              lambda sid, content: self.sent.append(loop.time())),
+            mock.patch.object(server_module, "STREAM_MIN_INTERVAL", self.INTERVAL),
+        ]
+        for p in self.patches:
+            p.start()
+        self.task = asyncio.create_task(server_module.stream_session("session-1"))
+        await asyncio.sleep(0)
+
+    async def asyncTearDown(self):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+        for p in self.patches:
+            p.stop()
+        clients.clear()
+
+    async def test_first_change_after_a_quiet_spell_is_sent_immediately(self):
+        await asyncio.sleep(self.INTERVAL * 1.5)
+        before = len(self.sent)
+        changed_at = asyncio.get_running_loop().time()
+        self.session.notifications.put_nowait(None)
+        await asyncio.sleep(self.INTERVAL / 4)
+
+        self.assertEqual(len(self.sent), before + 1)
+        self.assertLess(self.sent[-1] - changed_at, self.INTERVAL / 4)
+
+    async def test_a_burst_of_changes_is_spaced_by_the_min_interval(self):
+        await asyncio.sleep(self.INTERVAL * 1.5)
+        before = len(self.sent)
+        for _ in range(3):
+            self.session.notifications.put_nowait(None)
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(self.INTERVAL * 3.5)
+
+        burst = self.sent[before:]
+        self.assertEqual(len(burst), 3)
+        for earlier, later in zip(burst, burst[1:]):
+            self.assertGreaterEqual(later - earlier, self.INTERVAL * 0.95)
 
 
 class InputValidationTest(unittest.TestCase):
@@ -215,6 +362,40 @@ class DecodeImagePayloadTest(unittest.TestCase):
     def test_rejects_non_string_or_empty(self):
         for bad in (None, b"bytes", "", 123):
             self.assertIsNone(decode_image_payload(bad))
+
+    def test_transport_carries_the_largest_accepted_image(self):
+        data_url = "data:image/png;base64," + "A" * (4 * -(-MAX_IMAGE_BYTES // 3))
+        packet = '42["pasteImage",{"sessionId":"%s","data":"%s"}]' % ("x" * 64, data_url)
+        self.assertGreaterEqual(server_module.sio.eio.max_http_buffer_size, len(packet))
+
+
+class WaitForClipboardChangeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_text_once_the_pasteboard_changes(self):
+        counts = iter([7, 7, 8])
+        with mock.patch.object(server_module, "pasteboard_change_count", lambda: next(counts)), \
+                mock.patch.object(server_module, "pasteboard_text", lambda: "copied"):
+            text = await wait_for_clipboard_change(7, timeout=1, interval=0)
+        self.assertEqual(text, "copied")
+
+    async def test_returns_none_when_nothing_is_copied(self):
+        with mock.patch.object(server_module, "pasteboard_change_count", lambda: 7), \
+                mock.patch.object(server_module, "pasteboard_text", lambda: "stale"):
+            text = await wait_for_clipboard_change(7, timeout=0.05, interval=0.01)
+        self.assertIsNone(text)
+
+    async def test_returns_none_without_a_pasteboard(self):
+        with mock.patch.object(server_module, "pasteboard_change_count", lambda: None):
+            self.assertIsNone(await wait_for_clipboard_change(7, timeout=1, interval=0))
+
+
+class ClipboardTextTest(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_the_current_pasteboard_text(self):
+        with mock.patch.object(server_module, "pasteboard_text", lambda: "from pbcopy"):
+            self.assertEqual(await server_module.on_clipboard_text("sid"), "from pbcopy")
+
+    async def test_returns_none_without_a_pasteboard(self):
+        with mock.patch.object(server_module, "pasteboard_text", lambda: None):
+            self.assertIsNone(await server_module.on_clipboard_text("sid"))
 
 
 class ClientOriginsTest(unittest.TestCase):

@@ -12,3 +12,4 @@ bun.lock
 /caddy
 /Caddyfile
 /.caddy.env
+.update-dns.log

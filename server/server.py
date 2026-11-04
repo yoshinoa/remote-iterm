@@ -16,6 +16,7 @@ import ctypes
 import json
 import math
 import os
+import re
 import resource
 import signal
 import socket
@@ -41,6 +42,7 @@ MAX_INPUT_BYTES = 1_048_576
 
 # Upper bound on a pasted image (decoded bytes) written to the Mac pasteboard.
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_SOCKET_PAYLOAD = MAX_IMAGE_BYTES * 4 // 3 + 64 * 1024
 
 # Watched panes receive only their recent tail on each screen change. Older
 # content is fetched in pages when the client scrolls upward, avoiding a full
@@ -95,7 +97,8 @@ def client_origins() -> list[str]:
 
 
 sio = socketio.AsyncServer(
-    async_mode="aiohttp", cors_allowed_origins=client_origins())
+    async_mode="aiohttp", cors_allowed_origins=client_origins(),
+    max_http_buffer_size=MAX_SOCKET_PAYLOAD)
 app = web.Application()
 sio.attach(app)
 
@@ -437,6 +440,9 @@ _DEFAULT_ANSI = [
 ]
 _DEFAULT_PALETTE = {"fg": "#d4d4d8", "bg": "#0a0a0a", "ansi": _DEFAULT_ANSI}
 
+_LINK_SCHEMES = ("http://", "https://", "mailto:")
+_BARE_URL = re.compile(r"https?://[^\s<>\"'`]*[^\s<>\"'`.,;:!?)\]}]")
+
 
 def _hex(rgb) -> str:
     # iTerm2 profile colors are floats (0-255); cell colors are ints. Normalize.
@@ -501,16 +507,57 @@ def _resolve(color, pal) -> str | None:
     return None  # alternate / default
 
 
-def _line_runs(line, pal, cursor_x: int | None = None) -> list:
+def _cell_links(cells: list, styles: list) -> list:
+    owner = [x for x, ch in enumerate(cells) for _ in ch]
+    links = [None] * len(cells)
+    for m in _BARE_URL.finditer("".join(cells)):
+        for x in range(owner[m.start()], owner[m.end() - 1] + 1):
+            links[x] = m.group()
+    for x, style in enumerate(styles):
+        url = style.url
+        if url is not None and url.url.lower().startswith(_LINK_SCHEMES):
+            links[x] = url.url
+    return links
+
+
+def _line_cells(line) -> tuple[list, list]:
+    cells: list = []
+    styles: list = []
+    while (style := line.style_at(len(styles))) is not None:
+        cells.append(line.string_at(len(styles)).replace("\x00", " "))
+        styles.append(style)
+    return cells, styles
+
+
+def _wrapped_links(lines) -> list:
+    out: list = []
+    cells: list = []
+    styles: list = []
+    sizes: list = []
+    for i, line in enumerate(lines):
+        line_cells, line_styles = _line_cells(line)
+        cells += line_cells
+        styles += line_styles
+        sizes.append(len(line_cells))
+        if line.hard_eol or i == len(lines) - 1:
+            links = _cell_links(cells, styles)
+            for n in sizes:
+                out.append(links[:n])
+                links = links[n:]
+            cells, styles, sizes = [], [], []
+    return out
+
+
+def _line_runs(line, pal, cursor_x: int | None = None, links: list | None = None) -> list:
     """Group a line into styled runs, optionally marking its cursor cell."""
+    cells, styles = _line_cells(line)
+    if links is None:
+        links = _cell_links(cells, styles)
     runs: list = []
     cur = None
     buf = ""
     x = 0
-    while True:
-        style = line.style_at(x)
-        if style is None:
-            break
+    for style, ch, link in zip(styles, cells, links):
         if cursor_x == x:
             if buf:
                 runs.append(_make_run(cur, buf))
@@ -518,12 +565,11 @@ def _line_runs(line, pal, cursor_x: int | None = None) -> list:
             # The client renders this as a zero-width overlay, so the cursor
             # does not move the character underneath it.
             runs.append({"t": "", "c": True})
-        ch = line.string_at(x).replace("\x00", " ")
         fg = _resolve(style.fg_color, pal)
         bg = _resolve(style.bg_color, pal)
         if style.inverse:
             fg, bg = (bg or pal["bg"]), (fg or pal["fg"])
-        key = (fg, bg, bool(style.bold), bool(style.faint))
+        key = (fg, bg, bool(style.bold), bool(style.faint), link)
         if key != cur:
             if buf:
                 runs.append(_make_run(cur, buf))
@@ -548,8 +594,10 @@ def _line_runs(line, pal, cursor_x: int | None = None) -> list:
 
 
 def _make_run(key, text: str) -> dict:
-    fg, bg, bold, dim = key
+    fg, bg, bold, dim, link = key
     run = {"t": text}
+    if link:
+        run["u"] = link
     if fg:
         run["f"] = fg
     if bg:
@@ -562,7 +610,8 @@ def _make_run(key, text: str) -> dict:
 
 
 def _content_line_range(
-        info, line_count: int, before_line: int | None = None
+        info, line_count: int, before_line: int | None = None,
+        alternate_screen: bool = False,
 ) -> tuple[int, int, int, int]:
     """Return a page within the complete range retained by iTerm.
 
@@ -573,6 +622,8 @@ def _content_line_range(
     available_first = info.overflow
     terminal_end = (available_first + info.scrollback_buffer_height
                     + info.mutable_area_height)
+    if alternate_screen:
+        available_first = terminal_end - info.mutable_area_height
     page_end = terminal_end
     if before_line is not None:
         page_end = min(page_end, max(available_first, before_line))
@@ -597,19 +648,27 @@ async def read_content(
             info = await session.async_get_line_info()
             if screen is None:
                 screen = await session.async_get_screen_contents()
+            alternate = await session.async_get_variable("showingAlternateScreen")
+            mouse_mode = await session.async_get_variable("mouseReportingMode")
             first, count, available_first, terminal_end = _content_line_range(
-                info, line_count, before_line)
+                info, line_count, before_line, bool(alternate))
+            mouse = {
+                "mouse": isinstance(mouse_mode, int) and mouse_mode >= 0,
+                "screenFirstLine": terminal_end - info.mutable_area_height,
+            }
             if count <= 0:
                 return {
                     "lines": [], "fg": pal["fg"], "bg": pal["bg"],
                     "firstLine": first, "availableFirstLine": available_first,
                     "terminalEnd": terminal_end,
                     "isLatest": before_line is None,
+                    **mouse,
                 }
             lines = await session.async_get_contents(first, count)
         cursor = screen.cursor_coord
+        links = _wrapped_links(lines)
         rendered = [
-            _line_runs(line, pal, cursor.x if first + i == cursor.y else None)
+            _line_runs(line, pal, cursor.x if first + i == cursor.y else None, links[i])
             for i, line in enumerate(lines)
         ]
         return {
@@ -617,6 +676,7 @@ async def read_content(
             "firstLine": first, "availableFirstLine": available_first,
             "terminalEnd": terminal_end,
             "isLatest": before_line is None,
+            **mouse,
         }
     except Exception:
         return None
@@ -711,6 +771,39 @@ def decode_image_payload(value) -> bytes | None:
     return raw
 
 
+def pasteboard_change_count() -> int | None:
+    try:
+        from AppKit import NSPasteboard
+    except ImportError:
+        return None
+    return int(NSPasteboard.generalPasteboard().changeCount())
+
+
+def pasteboard_text() -> str | None:
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+    except ImportError:
+        return None
+    text = NSPasteboard.generalPasteboard().stringForType_(NSPasteboardTypeString)
+    return None if text is None else str(text)
+
+
+async def wait_for_clipboard_change(
+        since: int, timeout: float = 1.5, interval: float = 0.05,
+) -> str | None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        count = pasteboard_change_count()
+        if count is None:
+            return None
+        if count != since:
+            return pasteboard_text()
+        if loop.time() >= deadline:
+            return None
+        await asyncio.sleep(interval)
+
+
 # --- Live streaming of watched sessions ----------------------------------------
 #
 # The client tells us which sessions it is viewing (the `watch` event); we run
@@ -728,14 +821,19 @@ async def stream_session(session_id: str) -> None:
         last_content[session_id] = content
         queue_content_for_watchers(session_id, content)
 
+    loop = asyncio.get_running_loop()
+    last_read = loop.time()
     try:
-        # The notification itself is enough: waiting briefly before fetching the
-        # current screen coalesces bursts of changes and avoids allocating a
-        # stale screen snapshot for every byte of fast terminal output.
+        # The first change after a quiet spell is read at once so keystroke
+        # echo isn't delayed; changes within STREAM_MIN_INTERVAL of the last
+        # read wait out the remainder, coalescing bursts of fast output.
         async with session.get_screen_streamer(want_contents=False) as streamer:
             while True:
                 await streamer.async_get()
-                await asyncio.sleep(STREAM_MIN_INTERVAL)
+                wait = last_read + STREAM_MIN_INTERVAL - loop.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                last_read = loop.time()
                 if not clients:
                     continue
                 content = await read_content(session_id)
@@ -940,6 +1038,24 @@ async def on_paste_image(sid, data):
         await session.async_send_text("\x16")  # Ctrl+V
 
 
+@sio.on("clipboardCount")
+async def on_clipboard_count(sid):
+    return pasteboard_change_count()
+
+
+@sio.on("clipboardSince")
+async def on_clipboard_since(sid, data):
+    since = data.get("count") if isinstance(data, dict) else None
+    if not isinstance(since, int):
+        return None
+    return await wait_for_clipboard_change(since)
+
+
+@sio.on("clipboardText")
+async def on_clipboard_text(sid):
+    return pasteboard_text()
+
+
 @sio.on("newTab")
 async def on_new_tab(sid):
     window = itermapp.current_window if itermapp else None
@@ -1015,6 +1131,27 @@ async def on_focus(sid, data):
 
 # --- Entry point ---------------------------------------------------------------
 
+async def connection_watchdog(stop: asyncio.Event) -> None:
+    """Exit the process when iTerm2's API connection dies.
+
+    The iTerm2 Python API has no reconnection: if iTerm2 quits, every call
+    against the dead websocket hangs or errors and the server wedges (ignoring
+    even `stop`/`restart`). Probing with a cheap refresh and tripping `stop` on
+    failure lets the process exit cleanly so a supervisor (launchd KeepAlive)
+    can relaunch it once iTerm2 is back.
+    """
+    while not stop.is_set():
+        await asyncio.sleep(5)
+        try:
+            await itermapp.async_refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"iTerm2 connection lost ({exc!r}); shutting down for restart")
+            stop.set()
+            return
+
+
 async def main() -> None:
     global connection, itermapp, screen_size, shared_key
     screen_size = read_screen_size()
@@ -1031,15 +1168,17 @@ async def main() -> None:
     await site.start()
     print(f"Server running on http://0.0.0.0:{PORT}")
 
+    # Clean shutdown (incl. `iterm-server stop`, which sends SIGTERM).
+    stop = asyncio.Event()
+
     background_tasks = [
         asyncio.create_task(layout_monitor()),
         asyncio.create_task(focus_monitor()),
         asyncio.create_task(sync_loop()),
         asyncio.create_task(health_loop()),
+        asyncio.create_task(connection_watchdog(stop)),
     ]
 
-    # Clean shutdown (incl. `iterm-server stop`, which sends SIGTERM).
-    stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:

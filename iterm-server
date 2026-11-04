@@ -59,6 +59,24 @@ ensure_venv() {
   return 0
 }
 
+# If a Caddyfile is present, allow its site domain through CORS so the client
+# works when loaded via the HTTPS reverse proxy (unless already configured).
+derive_origins() {
+  if [ -z "${REMOTE_ITERM_ORIGINS:-}" ] && [ -f "$CADDYFILE" ]; then
+    CADDY_ADDR=$(grep -m1 -oE '^[[:space:]]*[A-Za-z0-9.-]+\.[A-Za-z]{2,}(:[0-9]+)?' "$CADDYFILE" | tr -d '[:space:]')
+    if [ -n "$CADDY_ADDR" ]; then
+      CADDY_HOST="${CADDY_ADDR%%:*}"
+      # Allow the clean-URL origin (https://host, for access via a 443 redirect)
+      # and, when a port is set, the explicit-port origin too.
+      if [ "$CADDY_ADDR" = "$CADDY_HOST" ]; then
+        export REMOTE_ITERM_ORIGINS="https://$CADDY_HOST"
+      else
+        export REMOTE_ITERM_ORIGINS="https://$CADDY_HOST,https://$CADDY_ADDR"
+      fi
+    fi
+  fi
+}
+
 do_start() {
   local shared_key
   if lsof -nP -tiTCP:7291 -sTCP:LISTEN >/dev/null 2>&1; then
@@ -73,21 +91,7 @@ do_start() {
   ensure_venv || return 1
   shared_key="$("$VENV/bin/python" "$DIR/server/auth.py")" || return 1
 
-  # If a Caddyfile is present, allow its site domain through CORS so the client
-  # works when loaded via the HTTPS reverse proxy (unless already configured).
-  if [ -z "${REMOTE_ITERM_ORIGINS:-}" ] && [ -f "$CADDYFILE" ]; then
-    CADDY_ADDR=$(grep -m1 -oE '^[[:space:]]*[A-Za-z0-9.-]+\.[A-Za-z]{2,}(:[0-9]+)?' "$CADDYFILE" | tr -d '[:space:]')
-    if [ -n "$CADDY_ADDR" ]; then
-      CADDY_HOST="${CADDY_ADDR%%:*}"
-      # Allow the clean-URL origin (https://host, for access via a 443 redirect)
-      # and, when a port is set, the explicit-port origin too.
-      if [ "$CADDY_ADDR" = "$CADDY_HOST" ]; then
-        export REMOTE_ITERM_ORIGINS="https://$CADDY_HOST"
-      else
-        export REMOTE_ITERM_ORIGINS="https://$CADDY_HOST,https://$CADDY_ADDR"
-      fi
-    fi
-  fi
+  derive_origins
 
   # exec in the subshell so $! is the real daemon pid (not the subshell wrapper),
   # which keeps the pidfile accurate for `stop`.
@@ -191,9 +195,122 @@ do_stop() {
   fi
 }
 
+# Supervisor mode for launchd (see install-service). Unlike `start`, this stays
+# in the foreground supervising the Python server: launchd tracks THIS process,
+# restarts it (KeepAlive) whenever the server exits, and its stdout/stderr are
+# captured by the plist's log paths. The client and Caddy run as tracked
+# children and are torn down whenever this process is asked to exit, so a
+# relaunch always starts from clean ports.
+do_foreground() {
+  # The server needs iTerm2's API; launch it hidden (-g, no focus steal) if the
+  # user hasn't opened it yet. If it later quits, the server's watchdog exits
+  # and launchd relaunches us — which re-opens iTerm2 here.
+  open -ga iTerm 2>/dev/null || true
+
+  # Clear any stragglers from a previous run so --strictPort / the proxy bind.
+  for port in 7291 7292 8443; do
+    for pid in $(lsof -nP -tiTCP:$port -sTCP:LISTEN 2>/dev/null); do
+      pkill -P "$pid" 2>/dev/null
+      kill "$pid" 2>/dev/null
+    done
+  done
+
+  ensure_venv || exit 1
+  "$VENV/bin/python" "$DIR/server/auth.py" >/dev/null || exit 1
+  derive_origins
+
+  CHILD_PIDS=()
+  cleanup() {
+    trap - EXIT INT TERM
+    for pid in "${CHILD_PIDS[@]}"; do
+      pkill -P "$pid" 2>/dev/null
+      kill "$pid" 2>/dev/null
+    done
+  }
+  trap cleanup EXIT INT TERM
+
+  ( cd "$DIR/client" && exec npx vite --host --port 7292 --strictPort ) &
+  CHILD_PIDS+=($!)
+
+  if [ -f "$CADDYFILE" ]; then
+    CADDY_BIN="$DIR/caddy"
+    [ -x "$CADDY_BIN" ] || CADDY_BIN="$(command -v caddy 2>/dev/null)"
+    if [ -n "$CADDY_BIN" ]; then
+      [ -f "$DIR/.caddy.env" ] && { set -a; . "$DIR/.caddy.env"; set +a; }
+      ( exec "$CADDY_BIN" run --config "$CADDYFILE" --adapter caddyfile ) &
+      CHILD_PIDS+=($!)
+    fi
+  fi
+
+  ( cd "$DIR/server" && exec "$VENV/bin/python" -u server.py ) &
+  SERVER_PID=$!
+  CHILD_PIDS+=($SERVER_PID)
+  wait "$SERVER_PID"
+}
+
+SERVICE_LABEL="ca.jiye.remote-iterm"
+PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+
+# Install a launchd LaunchAgent so the stack starts at login and is restarted
+# automatically (KeepAlive) if it exits — including the server's own exit when
+# iTerm2 quits. The plist is generated with this machine's paths (repo, node,
+# logs) so nothing user-specific has to live in the repo.
+do_install_service() {
+  local node_bin
+  node_bin="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/node)")"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SERVICE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$DIR/iterm-server</string>
+    <string>foreground</string>
+  </array>
+  <key>WorkingDirectory</key><string>$DIR</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$node_bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$LOGFILE</string>
+  <key>StandardErrorPath</key><string>$LOGFILE</string>
+</dict>
+</plist>
+PLISTEOF
+
+  # Stop any manually-started instance so launchd owns the ports.
+  do_stop >/dev/null 2>&1
+  launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || {
+    echo "  Failed to load service ($PLIST)" >&2
+    return 1
+  }
+  launchctl enable "gui/$(id -u)/$SERVICE_LABEL"
+  echo "  Service installed and started ($SERVICE_LABEL)."
+  echo "  It now starts at login and restarts automatically."
+  echo "  Logs: $LOGFILE"
+  echo "  Manage: launchctl kickstart -k gui/$(id -u)/$SERVICE_LABEL   (restart)"
+}
+
+do_uninstall_service() {
+  launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null
+  rm -f "$PLIST"
+  echo "  Service removed ($SERVICE_LABEL)."
+}
+
 case "${1:-start}" in
-  start)   do_start ;;
-  stop)    do_stop ;;
-  restart) do_stop; sleep 1; do_start ;;
-  *)       echo "Usage: iterm-server [start|stop|restart]" ;;
+  start)             do_start ;;
+  stop)              do_stop ;;
+  restart)           do_stop; sleep 1; do_start ;;
+  foreground)        do_foreground ;;
+  install-service)   do_install_service ;;
+  uninstall-service) do_uninstall_service ;;
+  *)                 echo "Usage: iterm-server [start|stop|restart|foreground|install-service|uninstall-service]" ;;
 esac
