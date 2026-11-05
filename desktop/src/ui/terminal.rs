@@ -80,6 +80,25 @@ pub fn compose_row(runs: &[Run], overlay: &[(usize, char)]) -> (Vec<Run>, Option
             .unwrap_or_default();
         styles.push(base);
         let style = styles.len() - 1;
+        let same_style = |a: &Run, b: &Run| a.f == b.f && a.g == b.g && a.b == b.b && a.d == b.d && a.u == b.u;
+        let original = cells.clone();
+        for &(col, ch) in overlay {
+            let Some(&(was, was_style)) = original.get(col) else {
+                continue;
+            };
+            if was == ch || was == ' ' {
+                continue;
+            }
+            let mut next = col + 1;
+            while let Some(&(c, s)) = original.get(next) {
+                let gap = c == ' ' && original.get(next + 1).is_some_and(|&(n, _)| n == ' ');
+                if gap || !same_style(&styles[s], &styles[was_style]) {
+                    break;
+                }
+                cells[next] = (' ', 0);
+                next += 1;
+            }
+        }
         for &(col, ch) in overlay {
             if cells.len() <= col {
                 cells.resize(col + 1, (' ', 0));
@@ -125,7 +144,7 @@ mod tests {
         let green = Run { t: "❯ ab".into(), f: Some("#00ff00".into()), ..Run::default() };
         let ghost = Run { t: "cdef".into(), d: true, ..Run::default() };
         let (runs, _) = compose_row(&[green, Run { c: true, ..Run::default() }, ghost], &[(4, 'X'), (9, 'Y')]);
-        assert_eq!(text(&runs), "❯ abXdef Y");
+        assert_eq!(text(&runs), "❯ abX    Y");
         let x = runs.iter().find(|r| r.t.contains('X')).unwrap();
         assert_eq!(x.f.as_deref(), Some("#00ff00"));
         assert!(!x.d);
