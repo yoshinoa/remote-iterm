@@ -80,7 +80,8 @@ the end. The order changes in iTerm on the Mac too.
 
 | Keys | What they do |
 |---|---|
-| Any key, including Ctrl+W, Ctrl+R, Ctrl+T | Sent to the terminal |
+| Any other key, including Ctrl+W and Ctrl+R | Sent to the terminal |
+| Ctrl+T | Open a new tab |
 | Ctrl+1 … Ctrl+8 | Switch to tab N |
 | Ctrl+9 | Switch to the last tab |
 | Ctrl+Tab, Ctrl+Shift+Tab | Switch to the next or previous tab |

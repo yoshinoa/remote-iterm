@@ -724,6 +724,13 @@ impl RootView {
                 cx.stop_propagation();
                 return;
             }
+            if keystroke.key == "t" {
+                if let Some(conn) = &self.conn {
+                    conn.new_tab();
+                }
+                cx.stop_propagation();
+                return;
+            }
         }
         let typed_char = keystroke
             .key_char
