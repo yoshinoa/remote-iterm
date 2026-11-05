@@ -17,13 +17,37 @@ pub struct OverlayCell {
     pub ch: char,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Typed,
+    Erased,
+}
+
 #[derive(Clone, Debug)]
 struct Pending {
     line: i64,
     col: usize,
+    kind: Kind,
     expected: char,
     before: Option<Cell>,
     made_at: Instant,
+}
+
+impl Pending {
+    fn matches(&self, cell: Option<Cell>) -> bool {
+        if self.expected == ' ' {
+            is_blank(cell)
+        } else {
+            cell == Some(Cell { ch: self.expected, dim: false })
+        }
+    }
+
+    fn judged_by(&self, cursor_col: usize) -> bool {
+        match self.kind {
+            Kind::Typed => cursor_col > self.col,
+            Kind::Erased => cursor_col <= self.col,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -55,13 +79,14 @@ impl Predictor {
             .is_some_and(|text| text.chars().all(|c| c.width() == Some(1)))
     }
 
-    fn push(&mut self, screen: &Content, line: i64, col: usize, expected: char, now: Instant) {
+    fn upsert(&mut self, screen: &Content, line: i64, col: usize, kind: Kind, expected: char, now: Instant) {
         if let Some(existing) = self.pending.iter_mut().find(|p| p.line == line && p.col == col) {
+            existing.kind = kind;
             existing.expected = expected;
             existing.made_at = now;
             return;
         }
-        self.pending.push(Pending { line, col, expected, before: screen.cell(line, col), made_at: now });
+        self.pending.push(Pending { line, col, kind, expected, before: screen.cell(line, col), made_at: now });
     }
 
     pub fn on_key(&mut self, session_id: &str, key: PredictKey, screen: &Content, now: Instant) {
@@ -83,22 +108,28 @@ impl Predictor {
                 if col + 1 >= columns || ch.width() != Some(1) {
                     return self.reset();
                 }
-                self.push(screen, line, col, ch, now);
+                self.upsert(screen, line, col, Kind::Typed, ch, now);
                 self.cursor = Some((line, col + 1));
             }
             PredictKey::Backspace => {
-                let pops_pending = self
-                    .pending
-                    .last()
-                    .is_some_and(|p| p.line == line && p.col + 1 == col && p.expected != ' ' && p.before.is_none_or(|b| b.dim || b.ch == ' '));
-                if pops_pending {
-                    self.pending.pop();
-                    self.cursor = if self.pending.is_empty() { None } else { Some((line, col - 1)) };
-                } else if col == 0 {
-                    self.reset();
-                } else {
-                    self.push(screen, line, col - 1, ' ', now);
-                    self.cursor = Some((line, col - 1));
+                let Some(target) = col.checked_sub(1) else {
+                    return self.reset();
+                };
+                let pending_at_target = self.pending.iter().position(|p| p.line == line && p.col == target);
+                match pending_at_target {
+                    Some(ix) if self.pending[ix].kind == Kind::Typed && is_blank(self.pending[ix].before) && ix + 1 == self.pending.len() => {
+                        self.pending.pop();
+                        self.cursor = if self.pending.is_empty() { None } else { Some((line, target)) };
+                    }
+                    Some(_) => {
+                        self.upsert(screen, line, target, Kind::Erased, ' ', now);
+                        self.cursor = Some((line, target));
+                    }
+                    None if is_blank(screen.cell(line, target)) => self.reset(),
+                    None => {
+                        self.upsert(screen, line, target, Kind::Erased, ' ', now);
+                        self.cursor = Some((line, target));
+                    }
                 }
             }
         }
@@ -108,22 +139,26 @@ impl Predictor {
         if self.session.as_deref() != Some(session_id) || !screen.is_latest {
             return;
         }
+        let Some((cursor_line, cursor_col)) = screen.cursor() else {
+            return;
+        };
         let pending = std::mem::take(&mut self.pending);
         let mut kept = Vec::with_capacity(pending.len());
         for p in pending {
-            let cell = screen.cell(p.line, p.col);
-            let confirmed = if p.expected == ' ' {
-                is_blank(cell)
-            } else {
-                cell == Some(Cell { ch: p.expected, dim: false })
-            };
-            if confirmed {
-                self.confirmed_epoch = true;
-            } else if cell == p.before {
-                kept.push(p);
-            } else {
+            if p.line != cursor_line {
                 self.reset();
                 return;
+            }
+            if !p.judged_by(cursor_col) {
+                kept.push(p);
+                continue;
+            }
+            if !p.matches(screen.cell(p.line, p.col)) {
+                self.reset();
+                return;
+            }
+            if !p.matches(p.before) {
+                self.confirmed_epoch = true;
             }
         }
         self.pending = kept;
@@ -338,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn mid_line_insert_that_shifts_text_resets() {
+    fn mid_line_insert_confirms_as_the_cursor_passes() {
         let now = Instant::now();
         let mut p = confirmed_at("a", now);
         let mid = screen(vec![r("❯ a"), cur(), r("bc")]);
@@ -346,8 +381,104 @@ mod tests {
         p.on_key("s1", PredictKey::Char('Y'), &mid, now);
         assert_eq!(p.overlay(), vec![cell('X', 3), cell('Y', 4)]);
         p.on_content("s1", &screen(vec![r("❯ aX"), cur(), r("bc")]), now);
+        assert_eq!(p.overlay(), vec![cell('Y', 4)]);
+        p.on_content("s1", &screen(vec![r("❯ aXY"), cur(), r("bc")]), now);
+        assert!(p.overlay().is_empty());
+    }
+
+    fn lines(rows: Vec<Vec<Run>>) -> Content {
+        Content { lines: rows, first_line: L, terminal_end: L + 3, ..screen(vec![]) }
+    }
+
+    fn at(text: &str, col: usize) -> Vec<Run> {
+        let chars: Vec<char> = text.chars().collect();
+        vec![r(&chars[..col].iter().collect::<String>()), cur(), r(&chars[col..].iter().collect::<String>())]
+    }
+
+    #[test]
+    fn vim_motion_after_coincidental_match_is_never_drawn() {
+        let now = Instant::now();
+        let mut p = Predictor::new();
+        let s0 = lines(vec![at("hello world", 2), vec![r("second line")], vec![r("")]]);
+        p.on_key("s1", PredictKey::Char('l'), &s0, now);
+        let s1 = lines(vec![at("hello world", 3), vec![r("second line")], vec![r("")]]);
+        p.on_content("s1", &s1, now);
+        p.on_key("s1", PredictKey::Char('j'), &s1, now);
+        assert!(p.overlay().is_empty());
+        let s2 = lines(vec![vec![r("hello world")], at("second line", 3), vec![r("")]]);
+        p.on_content("s1", &s2, now);
+        assert!(p.overlay().is_empty());
+        assert_eq!(p.cursor(), None);
+        p.on_key("s1", PredictKey::Char('k'), &s2, now);
+        assert!(p.overlay().is_empty());
+    }
+
+    #[test]
+    fn cursor_leaving_the_predicted_line_resets() {
+        let now = Instant::now();
+        let mut p = confirmed_at("a", now);
+        p.on_key("s1", PredictKey::Char('j'), &prompt("a"), now);
+        assert_eq!(p.overlay(), vec![cell('j', 3)]);
+        let moved = Content { lines: vec![vec![r("previous output"), cur()], vec![r("❯ a")]], ..prompt("a") };
+        p.on_content("s1", &moved, now);
         assert!(p.overlay().is_empty());
         assert_hidden_epoch(&mut p, now);
+    }
+
+    #[test]
+    fn unrelated_snapshot_never_confirms_password_chars() {
+        let now = Instant::now();
+        let mut p = Predictor::new();
+        let pw = lines(vec![vec![r("Password:"), cur()], vec![r("")], vec![r("")]]);
+        for ch in ['c', 'o', ' '] {
+            p.on_key("s1", PredictKey::Char(ch), &pw, now);
+        }
+        p.on_content("s1", &pw, now);
+        let clock = lines(vec![vec![r("Password:"), cur()], vec![r("12:01")], vec![r("")]]);
+        p.on_content("s1", &clock, now);
+        p.on_key("s1", PredictKey::Char('x'), &clock, now);
+        assert!(p.overlay().is_empty());
+        assert_eq!(p.cursor(), None);
+    }
+
+    #[test]
+    fn backspace_into_a_blank_cell_is_not_predicted() {
+        let now = Instant::now();
+        let mut p = confirmed_at("a", now);
+        p.on_key("s1", PredictKey::Backspace, &prompt("a"), now);
+        assert_eq!(p.overlay(), vec![cell(' ', 2)]);
+        p.on_content("s1", &prompt(""), now);
+        assert!(p.overlay().is_empty());
+        p.on_key("s1", PredictKey::Backspace, &prompt(""), now);
+        assert!(p.overlay().is_empty());
+        assert_eq!(p.cursor(), None);
+        p.on_key("s1", PredictKey::Char('x'), &prompt(""), now);
+        p.on_content("s1", &prompt("x"), now);
+        assert!(p.overlay().is_empty());
+    }
+
+    #[test]
+    fn burst_survives_a_withdrawn_suggestion() {
+        let now = Instant::now();
+        let mut p = confirmed_at("g", now);
+        let suggested = screen(vec![r("❯ g"), cur(), r("it status")]);
+        for ch in ['o', ' ', 'b'] {
+            p.on_key("s1", PredictKey::Char(ch), &suggested, now);
+        }
+        p.on_content("s1", &prompt("go"), now);
+        assert_eq!(p.overlay(), vec![cell(' ', 4), cell('b', 5)]);
+        assert_eq!(p.cursor(), Some((L, 6)));
+    }
+
+    #[test]
+    fn typed_space_waits_for_the_cursor_before_confirming() {
+        let now = Instant::now();
+        let mut p = confirmed_at("ab", now);
+        p.on_key("s1", PredictKey::Char(' '), &prompt("ab"), now);
+        let spinner = Content { lines: vec![vec![r("✽ Thinking")], vec![r("❯ ab"), cur()]], ..prompt("ab") };
+        p.on_content("s1", &spinner, now);
+        p.on_key("s1", PredictKey::Char('x'), &spinner, now);
+        assert_eq!(p.overlay(), vec![cell(' ', 4), cell('x', 5)]);
     }
 
     #[test]
