@@ -68,8 +68,13 @@ By default it connects to `https://term.jiye.ca:8443`. Settings live in
 The window's size and position, and the zoom level, are saved there
 automatically.
 
-On Windows the tab bar is the title bar. Drag its empty space to move the
-window, and double-click it to maximize.
+On Windows the tab bar is the title bar. Drag the empty space to the right of
+the tabs to move the window, and double-click it to maximize. That space is
+always there: with many tabs open, the tabs shrink to make room. The top edge
+of the window resizes it.
+
+Drag a tab onto another to reorder them, or onto the empty space to move it to
+the end. The order changes in iTerm on the Mac too.
 
 ## Keys
 
@@ -78,6 +83,7 @@ window, and double-click it to maximize.
 | Any key, including Ctrl+W, Ctrl+R, Ctrl+T | Sent to the terminal |
 | Ctrl+1 … Ctrl+8 | Switch to tab N |
 | Ctrl+9 | Switch to the last tab |
+| Ctrl+Tab, Ctrl+Shift+Tab | Switch to the next or previous tab |
 | Ctrl+V | Paste text. An image, including a screenshot, goes to the Mac clipboard, and Ctrl+V is sent so Claude Code picks it up. With nothing to paste, nothing is sent |
 | Ctrl+C | Copy the selected text. With nothing selected it sends ^C |
 | Ctrl+Shift+C | Copy the selected text |
@@ -88,9 +94,6 @@ window, and double-click it to maximize.
 In apps that use the mouse, such as Claude Code, clicks, drags and the wheel
 go to the app. Everywhere else, dragging selects text and the wheel scrolls,
 loading older output as you reach the top.
-
-The **Mac clipboard** button in the tab bar copies whatever is on the Mac's
-clipboard (for example after `pbcopy`) to this PC.
 
 ## Developing on the Mac
 
@@ -118,9 +121,8 @@ cargo run
 running server are marked `#[ignore]`:
 
 - `cargo test connection -- --ignored` checks the connection.
-- `cargo test live_mac_clipboard -- --ignored` checks the clipboard button.
-  Set `REMOTE_ITERM_E2E_RESTART=1` to also restart the service and check
-  reconnecting.
+- `REMOTE_ITERM_E2E_RESTART=1 cargo test live_reconnect -- --ignored` restarts
+  the service and checks reconnecting.
 - `live_typing_prediction_and_password_safety` needs a scratch iTerm window,
   passed in as `REMOTE_ITERM_E2E_WINDOW` / `REMOTE_ITERM_E2E_SESSION`. It types
   into that window, so never point it at a real session.

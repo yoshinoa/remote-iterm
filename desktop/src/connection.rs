@@ -368,8 +368,8 @@ impl ConnHandle {
         self.emit("closeTab", Some(json!({ "tabId": tab_id })));
     }
 
-    pub async fn clipboard_text(&self) -> Option<String> {
-        self.ack("clipboardText", None).await?.as_str().map(str::to_string)
+    pub fn move_tab(&self, tab_id: &str, to_index: u32) {
+        self.emit("moveTab", Some(json!({ "tabId": tab_id, "toIndex": to_index })));
     }
 
     pub async fn clipboard_count(&self) -> Option<i64> {

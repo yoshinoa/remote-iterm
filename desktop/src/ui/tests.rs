@@ -471,25 +471,6 @@ fn window_picker_switches_window(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn mac_clipboard_button_copies_text(cx: &mut TestAppContext) {
-    let mut h = ready(cx);
-    click(&mut h, "mac-clipboard");
-    let sent = h.answer(|event| (event == "clipboardText").then(|| json!("from pbcopy")));
-    assert!(sent.iter().any(|(e, _)| e == "ack:clipboardText"));
-    assert_eq!(h.cx.read_from_clipboard().and_then(|i| i.text()).as_deref(), Some("from pbcopy"));
-    assert_eq!(h.view.read_with(h.cx, |v, _| v.clip_status), Some(true));
-}
-
-#[gpui::test]
-fn mac_clipboard_button_reports_nothing_to_copy(cx: &mut TestAppContext) {
-    let mut h = ready(cx);
-    click(&mut h, "mac-clipboard");
-    h.answer(|_| None);
-    assert_eq!(h.cx.read_from_clipboard(), None);
-    assert_eq!(h.view.read_with(h.cx, |v, _| v.clip_status), Some(false));
-}
-
-#[gpui::test]
 fn history_request_is_not_stuck_after_switching_or_reconnecting(cx: &mut TestAppContext) {
     let mut h = ready(cx);
     let at = cell_point(&mut h, 0, 0);

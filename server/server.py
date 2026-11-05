@@ -1130,6 +1130,30 @@ async def on_close_tab(sid, data=None):
     await push_state()
 
 
+@sio.on("moveTab")
+async def on_move_tab(sid, data=None):
+    tab_id = data.get("tabId") if isinstance(data, dict) else None
+    to_index = data.get("toIndex") if isinstance(data, dict) else None
+    if itermapp is None or not tab_id or not isinstance(to_index, int):
+        return
+    for window in itermapp.windows:
+        tabs = list(window.tabs)
+        moving = next((tab for tab in tabs if tab.tab_id == tab_id), None)
+        if moving is None:
+            continue
+        old_position = tabs.index(moving)
+        tabs.remove(moving)
+        position = max(0, min(to_index - 1, len(tabs)))
+        if position != old_position:
+            tabs.insert(position, moving)
+            try:
+                await window.async_set_tabs(tabs)
+            except Exception as err:
+                print(f"moveTab error: {err}")
+        break
+    await push_state()
+
+
 @sio.on("renameSession")
 async def on_rename_session(sid, data):
     session_id = data.get("sessionId")

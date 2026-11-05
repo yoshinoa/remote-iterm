@@ -160,6 +160,18 @@ impl Model {
         }
     }
 
+    pub fn select_adjacent_tab(&mut self, forward: bool) -> Vec<Effect> {
+        let tabs = self.current_tabs();
+        if tabs.is_empty() {
+            return Vec::new();
+        }
+        let len = tabs.len();
+        let current = self.tab_id.as_ref().and_then(|id| tabs.iter().position(|t| &t.id == id)).unwrap_or(0);
+        let next = if forward { (current + 1) % len } else { (current + len - 1) % len };
+        let id = tabs[next].id.clone();
+        self.select_tab(&id)
+    }
+
     pub fn select_session(&mut self, session_id: &str) -> Vec<Effect> {
         let known = self.current_tab().is_some_and(|t| t.sessions.iter().any(|s| s.id == session_id));
         if !known {

@@ -97,24 +97,11 @@ fn live_typing_prediction_and_password_safety(cx: &mut TestAppContext) {
 
 #[gpui::test]
 #[ignore]
-fn live_mac_clipboard_button_and_reconnect(cx: &mut TestAppContext) {
+fn live_reconnect_after_service_restart(cx: &mut TestAppContext) {
     let key = std::fs::read_to_string(dirs::home_dir().unwrap().join("Library/Application Support/remote-iterm/access-key")).unwrap();
     let config = Config { server_url: "http://localhost:7291".into(), key: Some(key.trim().into()), ..Config::default() };
     let (view, cx) = cx.add_window_view(move |window, cx| RootView::new(config, window, cx));
     assert!(wait_until(cx, &view, 10, |v| v.connected && v.model.shown().is_some()), "never connected");
-
-    cx.simulate_event(gpui::MouseMoveEvent { position: gpui::point(gpui::px(1.0), gpui::px(1.0)), pressed_button: None, modifiers: gpui::Modifiers::none() });
-    let bounds = cx.debug_bounds("mac-clipboard").expect("clipboard button");
-    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
-    assert!(wait_until(cx, &view, 5, |v| v.clip_status.is_some()), "clipboard button never finished");
-    let mac = String::from_utf8(std::process::Command::new("pbpaste").output().unwrap().stdout).unwrap();
-    let got = cx.read_from_clipboard().and_then(|i| i.text());
-    if mac.is_empty() {
-        assert_eq!(view.read_with(cx, |v, _| v.clip_status), Some(false));
-    } else {
-        assert_eq!(got.as_deref(), Some(mac.as_str()));
-        eprintln!("mac clipboard copied: {} chars", mac.chars().count());
-    }
 
     if std::env::var("REMOTE_ITERM_E2E_RESTART").is_ok() {
         let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output().unwrap().stdout).unwrap();

@@ -25,6 +25,26 @@ use std::time::{Duration, Instant};
 type Cellpos = (i64, usize);
 type Connector = fn(String, String) -> (ConnHandle, futures::channel::mpsc::UnboundedReceiver<ServerEvent>);
 
+#[derive(Clone)]
+struct DraggedTab {
+    tab_id: String,
+    title: SharedString,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_size(px(12.0))
+            .whitespace_nowrap()
+            .bg(theme::color(theme::BORDER))
+            .text_color(theme::color(theme::ACCENT))
+            .child(self.title.clone())
+    }
+}
+
 struct Drag {
     mods: u8,
     last: (u32, u32),
@@ -52,12 +72,10 @@ pub struct RootView {
     history_pending: Option<i64>,
     wheel_accum: f32,
     pub(crate) config_path: PathBuf,
-    pub(crate) clip_status: Option<bool>,
     connector: Connector,
     pub(crate) bitmap_reader: fn() -> Option<gpui::Image>,
     key_input: String,
     marked: Option<String>,
-    clip_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
     zoom_save_task: Option<Task<()>>,
     events_task: Option<Task<()>>,
@@ -91,12 +109,10 @@ impl RootView {
             history_pending: None,
             wheel_accum: 0.0,
             config_path: config::config_path(),
-            clip_status: None,
             connector: connection::start,
             bitmap_reader: crate::clipboard::read_bitmap,
             key_input: String::new(),
             marked: None,
-            clip_task: None,
             save_task: None,
             zoom_save_task: None,
             events_task: None,
@@ -232,28 +248,6 @@ impl RootView {
         }
         cx.stop_propagation();
         cx.notify();
-    }
-
-    fn copy_mac_clipboard(&mut self, cx: &mut Context<Self>) {
-        let Some(conn) = self.conn.clone() else {
-            return;
-        };
-        self.clip_task = Some(cx.spawn(async move |this, cx| {
-            let text = conn.clipboard_text().await.filter(|t| !t.is_empty());
-            let ok = text.is_some();
-            if let Some(text) = text {
-                let _ = cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
-            }
-            let _ = this.update(cx, |view, cx| {
-                view.clip_status = Some(ok);
-                cx.notify();
-            });
-            cx.background_executor().timer(Duration::from_millis(1500)).await;
-            let _ = this.update(cx, |view, cx| {
-                view.clip_status = None;
-                cx.notify();
-            });
-        }));
     }
 
     pub(crate) fn connect(&mut self, cx: &mut Context<Self>) {
@@ -679,6 +673,12 @@ impl RootView {
                 return;
             }
         }
+        if m.control && !m.alt && !m.platform && keystroke.key == "tab" {
+            let effects = self.model.select_adjacent_tab(!m.shift);
+            self.apply_effects(effects, cx);
+            cx.stop_propagation();
+            return;
+        }
         let plain_ctrl = m.control && !m.alt && !m.platform && !m.shift;
         if m.control && m.shift && !m.alt && !m.platform && keystroke.key == "c" {
             self.copy_selection(cx);
@@ -763,33 +763,57 @@ impl RootView {
             .child(button("window-close", "\u{E8BB}", WindowControlArea::Close, theme::color(theme::CLOSE_HOVER)))
     }
 
-    fn render_drag_area(&self, window: &Window) -> impl IntoElement {
-        let resize_strip = !window.is_maximized();
+    fn render_drag_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let last = self.model.current_tabs().len() as u32;
         div()
+            .id("titlebar-drag")
+            .debug_selector(|| "titlebar-drag".into())
             .flex_1()
+            .min_w(px(theme::DRAG_AREA_MIN_WIDTH))
             .h_full()
-            .flex()
-            .flex_col()
-            .when(resize_strip, |d| d.child(div().h(px(4.0)).flex_none()))
-            .child(
-                div()
-                    .id("titlebar-drag")
-                    .debug_selector(|| "titlebar-drag".into())
-                    .flex_1()
-                    .when(self.custom_titlebar, |d| d.window_control_area(WindowControlArea::Drag)),
-            )
+            .occlude()
+            .when(self.custom_titlebar, |d| d.window_control_area(WindowControlArea::Drag))
+            .on_drop(cx.listener(move |view, dragged: &DraggedTab, _, _| view.move_tab(&dragged.tab_id, last)))
+    }
+
+    fn render_resize_strip(&self, window: &Window) -> Option<impl IntoElement> {
+        (self.custom_titlebar && !window.is_maximized()).then(|| {
+            div()
+                .id("resize-strip")
+                .occlude()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w_full()
+                .h(px(theme::RESIZE_STRIP_HEIGHT))
+        })
+    }
+
+    fn move_tab(&mut self, tab_id: &str, to_index: u32) {
+        if let Some(conn) = &self.conn {
+            conn.move_tab(tab_id, to_index);
+        }
     }
 
     fn render_tab_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bar = div()
+            .relative()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .h(px(theme::TITLEBAR_HEIGHT))
+            .when(!self.custom_titlebar, |d| d.pr_2())
+            .bg(theme::color(theme::BAR))
+            .border_b_1()
+            .border_color(theme::color(theme::BORDER));
         if self.key_screen_visible() {
-            return div()
-                .flex()
-                .flex_row()
-                .flex_none()
-                .h(px(theme::TITLEBAR_HEIGHT))
-                .bg(theme::color(theme::BAR))
-                .child(self.render_drag_area(window))
+            return bar
+                .child(self.render_drag_area(cx))
                 .child(self.render_window_buttons(window))
+                .children(self.render_resize_strip(window))
                 .into_any_element();
         }
         let chip = |id: SharedString, active: bool| {
@@ -841,34 +865,14 @@ impl RootView {
                     .collect()
             })
             .unwrap_or_default();
-        let clip_label: SharedString = match self.clip_status {
-            Some(true) => "✓ copied".into(),
-            Some(false) => "✗ nothing".into(),
-            None => "Mac clipboard".into(),
-        };
-        let clip_color = match self.clip_status {
-            Some(true) => theme::ACCENT,
-            Some(false) => theme::DANGER,
-            None => theme::MUTED,
-        };
 
-        let mut bar = div()
-            .flex()
-            .flex_row()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .pl_2()
-            .h(px(theme::TITLEBAR_HEIGHT))
-            .when(!self.custom_titlebar, |d| d.pr_2())
-            .bg(theme::color(theme::BAR))
-            .border_b_1()
-            .border_color(theme::color(theme::BORDER));
+        let mut bar = bar;
         if windows.len() > 1 {
             for (number, id, active) in windows {
                 bar = bar.child(
                     chip(format!("window-{number}").into(), active)
                         .debug_selector(move || format!("window-{number}"))
+                        .flex_none()
                         .child(format!("W{number}"))
                         .on_click(cx.listener(move |view, _, _, cx| {
                             let effects = view.model.select_window(&id);
@@ -876,23 +880,31 @@ impl RootView {
                         })),
                 );
             }
-            bar = bar.child(div().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::color(theme::BORDER)));
+            bar = bar.child(div().flex_none().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::color(theme::BORDER)));
         }
+        let mut strip = div().flex().flex_row().items_center().gap_1().flex_initial().min_w(px(0.0)).overflow_hidden();
         for (index, id, tab_id, title) in tabs {
             let active = selected.as_deref() == Some(id.as_str());
+            let dragged = DraggedTab { tab_id: tab_id.clone(), title: title.clone() };
             let mut tab = chip(format!("tab-{index}").into(), active)
                 .debug_selector(move || format!("tab-{index}"))
+                .min_w(px(theme::TAB_MIN_WIDTH))
                 .max_w(px(260.0))
-                .child(div().overflow_hidden().text_ellipsis().child(title))
+                .overflow_hidden()
+                .child(div().flex_1().min_w(px(0.0)).overflow_hidden().text_ellipsis().child(title))
                 .on_click(cx.listener(move |view, _, _, cx| {
                     let effects = view.model.select_tab(&id);
                     view.apply_effects(effects, cx);
-                }));
+                }))
+                .on_drag(dragged, |dragged: &DraggedTab, _, _, cx| cx.new(|_| dragged.clone()))
+                .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::color(theme::SELECTION)))
+                .on_drop(cx.listener(move |view, dragged: &DraggedTab, _, _| view.move_tab(&dragged.tab_id, index)));
             if total_tabs > 1 {
                 tab = tab.child(
                     div()
                         .id(SharedString::from(format!("close-tab-{index}")))
                         .debug_selector(move || format!("close-tab-{index}"))
+                        .flex_none()
                         .px_1()
                         .rounded_sm()
                         .text_color(theme::color(theme::MUTED))
@@ -906,11 +918,12 @@ impl RootView {
                         })),
                 );
             }
-            bar = bar.child(tab);
+            strip = strip.child(tab);
         }
-        bar = bar.child(
+        bar = bar.child(strip).child(
             chip("new-tab".into(), false)
                 .debug_selector(|| "new-tab".into())
+                .flex_none()
                 .child("+")
                 .on_click(cx.listener(|view, _, _, _| {
                     if let Some(conn) = &view.conn {
@@ -918,13 +931,14 @@ impl RootView {
                     }
                 })),
         );
-        bar = bar.child(self.render_drag_area(window));
+        bar = bar.child(self.render_drag_area(cx));
         if panes.len() > 1 {
             for (number, id, label) in panes {
                 let active = shown.as_deref() == Some(id.as_str());
                 bar = bar.child(
                     chip(format!("pane-{number}").into(), active)
                         .debug_selector(move || format!("pane-{number}"))
+                        .flex_none()
                         .child(label)
                         .on_click(cx.listener(move |view, _, _, cx| {
                             let effects = view.model.select_session(&id);
@@ -932,17 +946,10 @@ impl RootView {
                         })),
                 );
             }
-            bar = bar.child(div().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::color(theme::BORDER)));
         }
-        bar.child(
-            chip("mac-clipboard".into(), false)
-                .debug_selector(|| "mac-clipboard".into())
-                .text_color(theme::color(clip_color))
-                .child(clip_label)
-                .on_click(cx.listener(|view, _, _, cx| view.copy_mac_clipboard(cx))),
-        )
-        .when(self.custom_titlebar, |d| d.child(div().w(px(6.0))).child(self.render_window_buttons(window)))
-        .into_any_element()
+        bar.when(self.custom_titlebar, |d| d.child(self.render_window_buttons(window)))
+            .children(self.render_resize_strip(window))
+            .into_any_element()
     }
 
     fn render_key_screen(&self) -> impl IntoElement {
