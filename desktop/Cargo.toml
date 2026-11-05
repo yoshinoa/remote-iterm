@@ -17,6 +17,8 @@ futures = "0.3"
 unicode-width = "0.2"
 dirs = "6"
 base64 = "0.22"
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }

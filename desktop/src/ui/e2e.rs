@@ -43,7 +43,7 @@ fn live_typing_prediction_and_password_safety(cx: &mut TestAppContext) {
     let window_id = std::env::var("REMOTE_ITERM_E2E_WINDOW").expect("scratch window id");
     let session_id = std::env::var("REMOTE_ITERM_E2E_SESSION").expect("scratch session id");
     let key = std::fs::read_to_string(dirs::home_dir().unwrap().join("Library/Application Support/remote-iterm/access-key")).unwrap();
-    let config = Config { server_url: "http://localhost:7291".into(), key: Some(key.trim().into()), window: None };
+    let config = Config { server_url: "http://localhost:7291".into(), key: Some(key.trim().into()), ..Config::default() };
     let (view, cx) = cx.add_window_view(move |window, cx| RootView::new(config, window, cx));
 
     assert!(wait_until(cx, &view, 10, |v| v.model.windows.iter().any(|w| w.id == window_id)), "state never arrived");
@@ -99,7 +99,7 @@ fn live_typing_prediction_and_password_safety(cx: &mut TestAppContext) {
 #[ignore]
 fn live_mac_clipboard_button_and_reconnect(cx: &mut TestAppContext) {
     let key = std::fs::read_to_string(dirs::home_dir().unwrap().join("Library/Application Support/remote-iterm/access-key")).unwrap();
-    let config = Config { server_url: "http://localhost:7291".into(), key: Some(key.trim().into()), window: None };
+    let config = Config { server_url: "http://localhost:7291".into(), key: Some(key.trim().into()), ..Config::default() };
     let (view, cx) = cx.add_window_view(move |window, cx| RootView::new(config, window, cx));
     assert!(wait_until(cx, &view, 10, |v| v.connected && v.model.shown().is_some()), "never connected");
 

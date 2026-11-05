@@ -8,9 +8,17 @@ pub const TEXT: u32 = 0xd4d4d8;
 pub const MUTED: u32 = 0x71717a;
 pub const DANGER: u32 = 0xfb7185;
 pub const SELECTION: u32 = 0x1e3a8a;
+pub const CLOSE_HOVER: u32 = 0xc42b1c;
+pub const TITLEBAR_HEIGHT: f32 = 34.0;
 pub const FONT_SIZE: f32 = 13.0;
 pub const LINE_HEIGHT: f32 = 17.0;
+pub const MIN_FONT_SIZE: f32 = 8.0;
+pub const MAX_FONT_SIZE: f32 = 32.0;
 pub const TEXT_PADDING: f32 = 8.0;
+
+pub fn line_height(font_size: f32) -> f32 {
+    (font_size * LINE_HEIGHT / FONT_SIZE).round()
+}
 
 pub fn font_family() -> &'static str {
     if cfg!(target_os = "windows") {

@@ -51,9 +51,12 @@ impl Harness<'_> {
 }
 
 fn harness_with_key<'a>(cx: &'a mut TestAppContext, key: Option<&str>) -> Harness<'a> {
+    harness_with_config(cx, Config { key: key.map(str::to_string), ..Config::default() })
+}
+
+fn harness_with_config(cx: &mut TestAppContext, config: Config) -> Harness<'_> {
     let (handle, commands) = ConnHandle::recording();
     let (events, rx) = futures::channel::mpsc::unbounded();
-    let config = Config { key: key.map(str::to_string), ..Config::default() };
     let path = std::env::temp_dir()
         .join(format!("remote-iterm-ui-test-{}-{}", std::process::id(), NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::SeqCst)))
         .join("desktop.json");
@@ -200,19 +203,45 @@ fn ctrl_v_with_image_sends_paste_image(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn ctrl_v_with_empty_clipboard_sends_literal(cx: &mut TestAppContext) {
+fn ctrl_v_with_empty_clipboard_sends_nothing(cx: &mut TestAppContext) {
     let mut h = ready(cx);
     h.cx.simulate_keystrokes("ctrl-v");
-    assert_eq!(keys_sent(&h.sent()), vec!["\x16"]);
+    let sent = h.sent();
+    assert!(keys_sent(&sent).is_empty());
+    assert!(sent.iter().all(|(event, _)| event != "pasteImage"));
+}
+
+fn bitmap() -> Option<gpui::Image> {
+    Some(gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0x89, b'P', b'N', b'G']))
+}
+
+#[gpui::test]
+fn ctrl_v_with_only_a_bitmap_sends_paste_image(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.view.update(h.cx, |view, _| view.bitmap_reader = bitmap);
+    h.cx.simulate_keystrokes("ctrl-v");
+    let sent = h.sent();
+    let (_, data) = sent.iter().find(|(event, _)| event == "pasteImage").expect("pasteImage sent");
+    assert_eq!(data["data"], "data:image/png;base64,iVBORw==");
+    assert!(keys_sent(&sent).is_empty());
+}
+
+#[gpui::test]
+fn ctrl_v_prefers_text_over_a_bitmap(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.view.update(h.cx, |view, _| view.bitmap_reader = bitmap);
+    h.cx.write_to_clipboard(gpui::ClipboardItem::new_string("ls".into()));
+    h.cx.simulate_keystrokes("ctrl-v");
+    let sent = h.sent();
+    assert_eq!(keys_sent(&sent), vec!["ls"]);
+    assert!(sent.iter().all(|(event, _)| event != "pasteImage"));
 }
 
 fn cell_point(h: &mut Harness, row: usize, col: usize) -> gpui::Point<gpui::Pixels> {
     h.cx.run_until_parked();
-    let (bounds, cw) = h.view.read_with(h.cx, |v, _| (v.term_bounds.get().expect("terminal laid out"), v.cell_width));
-    gpui::point(
-        bounds.origin.x + cw * (col as f32 + 0.5),
-        bounds.origin.y + gpui::px(crate::ui::theme::LINE_HEIGHT) * (row as f32 + 0.5),
-    )
+    let (bounds, cw, line) =
+        h.view.read_with(h.cx, |v, _| (v.term_bounds.get().expect("terminal laid out"), v.cell_width, v.line_height()));
+    gpui::point(bounds.origin.x + cw * (col as f32 + 0.5), bounds.origin.y + gpui::px(line) * (row as f32 + 0.5))
 }
 
 fn mouse_content(session: &str) -> SessionContent {
@@ -360,7 +389,7 @@ fn key_screen_takes_a_pasted_link_and_saves_it(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn key_screen_typing_and_backspace(cx: &mut TestAppContext) {
-    let mut h = harness_with_key(cx, None);
+    let h = harness_with_key(cx, None);
     h.cx.simulate_keystrokes("a b x backspace c enter");
     assert_eq!(h.view.read_with(h.cx, |v, _| v.config.key.clone()).as_deref(), Some("abc"));
 }
@@ -509,4 +538,122 @@ fn printable_keys_reach_the_terminal_through_text_input_only_once(cx: &mut TestA
     let mut h = ready(cx);
     h.cx.simulate_keystrokes("h shift-i space");
     assert_eq!(keys_sent(&h.sent()), vec!["h", "I", " "]);
+}
+
+fn font(h: &Harness) -> (f32, f32, gpui::Pixels) {
+    h.view.read_with(h.cx, |v, _| (v.font_size, v.line_height(), v.cell_width))
+}
+
+#[gpui::test]
+fn ctrl_plus_minus_and_zero_zoom_the_terminal(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    let (size, line, width) = font(&h);
+    assert_eq!((size, line), (13.0, 17.0));
+    h.cx.simulate_keystrokes("ctrl-=");
+    let (bigger, bigger_line, bigger_width) = font(&h);
+    assert_eq!(bigger, 14.0);
+    assert!(bigger_line > line && bigger_width > width);
+    h.cx.simulate_keystrokes("ctrl-+");
+    assert_eq!(font(&h).0, 15.0);
+    h.cx.simulate_keystrokes("ctrl-- ctrl-- ctrl-- ctrl--");
+    assert_eq!(font(&h).0, 11.0);
+    h.cx.simulate_keystrokes("ctrl-0");
+    assert_eq!(font(&h), (size, line, width));
+    assert!(keys_sent(&h.sent()).is_empty());
+}
+
+#[gpui::test]
+fn zoom_is_clamped(cx: &mut TestAppContext) {
+    let h = ready(cx);
+    for _ in 0..40 {
+        h.cx.simulate_keystrokes("ctrl--");
+    }
+    assert_eq!(font(&h).0, crate::ui::theme::MIN_FONT_SIZE);
+    for _ in 0..60 {
+        h.cx.simulate_keystrokes("ctrl-=");
+    }
+    assert_eq!(font(&h).0, crate::ui::theme::MAX_FONT_SIZE);
+}
+
+#[gpui::test]
+fn zoom_is_saved(cx: &mut TestAppContext) {
+    let h = ready(cx);
+    h.cx.simulate_keystrokes("ctrl-= ctrl-=");
+    h.cx.executor().advance_clock(std::time::Duration::from_secs(2));
+    h.cx.run_until_parked();
+    let path = h.view.read_with(h.cx, |v, _| v.config_path.clone());
+    assert_eq!(crate::config::load(&path).font_size, Some(15.0));
+}
+
+#[gpui::test]
+fn saved_zoom_is_used_at_startup(cx: &mut TestAppContext) {
+    let h = harness_with_config(cx, Config { key: Some("k".into()), font_size: Some(20.0), ..Config::default() });
+    assert_eq!(font(&h).0, 20.0);
+}
+
+#[gpui::test]
+fn ctrl_wheel_zooms_instead_of_reporting_the_wheel(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.send(ServerEvent::Content(mouse_content("s1")));
+    h.sent();
+    let at = cell_point(&mut h, 1, 2);
+    h.cx.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Lines(gpui::point(0.0, 1.0)),
+        modifiers: gpui::Modifiers::control(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    assert_eq!(font(&h).0, 14.0);
+    assert!(keys_sent(&h.sent()).is_empty());
+}
+
+#[gpui::test]
+fn selection_after_zoom_uses_the_new_cell_size(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.simulate_keystrokes("ctrl-= ctrl-= ctrl-= ctrl-= ctrl-=");
+    let a = cell_point(&mut h, 0, 0);
+    let b = cell_point(&mut h, 0, 8);
+    drag(&mut h, a, b);
+    h.cx.simulate_keystrokes("ctrl-c");
+    assert_eq!(h.cx.read_from_clipboard().and_then(|i| i.text()).as_deref(), Some("previous"));
+}
+
+fn custom_titlebar(h: &mut Harness) {
+    h.view.update(h.cx, |view, cx| {
+        view.custom_titlebar = true;
+        cx.notify();
+    });
+}
+
+#[gpui::test]
+fn custom_titlebar_has_window_buttons_and_a_drag_area(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    custom_titlebar(&mut h);
+    for selector in ["window-min", "window-max", "window-close", "titlebar-drag", "tab-1", "new-tab"] {
+        assert!(exists(&mut h, selector), "{selector}");
+    }
+    let close = h.cx.debug_bounds("window-close").unwrap();
+    let viewport = h.cx.update(|window, _| window.viewport_size());
+    assert_eq!(close.right(), viewport.width);
+    assert_eq!(close.top(), gpui::px(0.0));
+    assert!(close.size.height >= gpui::px(crate::ui::theme::TITLEBAR_HEIGHT - 1.0));
+}
+
+#[gpui::test]
+fn native_titlebar_has_no_window_buttons(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.view.update(h.cx, |view, _| view.custom_titlebar = false);
+    assert!(!exists(&mut h, "window-close"));
+    assert!(exists(&mut h, "tab-1"));
+}
+
+#[gpui::test]
+fn key_screen_sits_below_the_window_buttons(cx: &mut TestAppContext) {
+    let mut h = harness_with_key(cx, None);
+    custom_titlebar(&mut h);
+    assert!(exists(&mut h, "key-screen"));
+    assert!(!exists(&mut h, "new-tab"));
+    let close = h.cx.debug_bounds("window-close").expect("close button");
+    let screen = h.cx.debug_bounds("key-screen").expect("key screen");
+    assert!(screen.top() >= close.bottom());
 }

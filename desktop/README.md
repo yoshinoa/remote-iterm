@@ -40,11 +40,16 @@ By default it connects to `https://term.jiye.ca:8443`. Settings live in
 {
   "server_url": "https://term.jiye.ca:8443",
   "key": "…",
-  "window": { "x": 100, "y": 80, "width": 1100, "height": 700, "maximized": false }
+  "window": { "x": 100, "y": 80, "width": 1100, "height": 700, "maximized": false },
+  "font_size": 13
 }
 ```
 
-The window's size and position are saved there automatically.
+The window's size and position, and the zoom level, are saved there
+automatically.
+
+On Windows the tab bar is the title bar. Drag its empty space to move the
+window, and double-click it to maximize.
 
 ## Keys
 
@@ -53,10 +58,12 @@ The window's size and position are saved there automatically.
 | Any key, including Ctrl+W, Ctrl+R, Ctrl+T | Sent to the terminal |
 | Ctrl+1 … Ctrl+8 | Switch to tab N |
 | Ctrl+9 | Switch to the last tab |
-| Ctrl+V | Paste text. An image on the clipboard goes to the Mac clipboard, and Ctrl+V is sent so Claude Code picks it up |
+| Ctrl+V | Paste text. An image, including a screenshot, goes to the Mac clipboard, and Ctrl+V is sent so Claude Code picks it up. With nothing to paste, nothing is sent |
 | Ctrl+C | Copy the selected text. With nothing selected it sends ^C |
 | Ctrl+Shift+C | Copy the selected text |
 | Ctrl+click on a link | Open the link in your browser |
+| Ctrl+= and Ctrl+−, or Ctrl+wheel | Make the text bigger or smaller |
+| Ctrl+0 | Reset the text size |
 
 In apps that use the mouse, such as Claude Code, clicks, drags and the wheel
 go to the app. Everywhere else, dragging selects text and the wheel scrolls,

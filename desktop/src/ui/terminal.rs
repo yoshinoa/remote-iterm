@@ -1,10 +1,11 @@
 use crate::protocol::Run;
 use crate::ui::theme;
-use gpui::{Div, Hsla, ParentElement, Pixels, StyledText, Styled, TextRun, div, px};
+use gpui::{Div, Hsla, ParentElement, Pixels, StyledText, Styled, TextRun, div};
 
 pub struct TermStyle {
     pub fg: Hsla,
     pub cell_width: Pixels,
+    pub line_height: Pixels,
     pub cursor: Hsla,
     pub selection: Hsla,
 }
@@ -29,7 +30,7 @@ pub fn render_row(runs: &[Run], cursor_col: Option<usize>, highlight: Option<(us
         .collect();
     let mut row = div()
         .relative()
-        .h(px(theme::LINE_HEIGHT))
+        .h(style.line_height)
         .w_full()
         .whitespace_nowrap()
         .overflow_hidden();
@@ -40,7 +41,7 @@ pub fn render_row(runs: &[Run], cursor_col: Option<usize>, highlight: Option<(us
                 .top_0()
                 .left(style.cell_width * from as f32)
                 .w(style.cell_width * (to - from) as f32)
-                .h(px(theme::LINE_HEIGHT))
+                .h(style.line_height)
                 .bg(style.selection),
         );
     }
@@ -51,7 +52,7 @@ pub fn render_row(runs: &[Run], cursor_col: Option<usize>, highlight: Option<(us
                 .top_0()
                 .left(style.cell_width * col as f32)
                 .w(style.cell_width)
-                .h(px(theme::LINE_HEIGHT))
+                .h(style.line_height)
                 .bg(style.cursor),
         );
     }

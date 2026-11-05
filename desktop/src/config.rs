@@ -15,11 +15,13 @@ pub struct Config {
     pub key: Option<String>,
     #[serde(default)]
     pub window: Option<SavedWindow>,
+    #[serde(default)]
+    pub font_size: Option<f32>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { server_url: default_server_url(), key: None, window: None }
+        Self { server_url: default_server_url(), key: None, window: None, font_size: None }
     }
 }
 
@@ -57,6 +59,12 @@ pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
 pub fn remember_window(path: &Path, window: SavedWindow) -> std::io::Result<()> {
     let mut cfg = load(path);
     cfg.window = Some(window);
+    save(path, &cfg)
+}
+
+pub fn remember_font_size(path: &Path, size: f32) -> std::io::Result<()> {
+    let mut cfg = load(path);
+    cfg.font_size = Some(size);
     save(path, &cfg)
 }
 
@@ -144,6 +152,7 @@ mod tests {
             server_url: "https://example:8443".into(),
             key: Some("secret".into()),
             window: Some(SavedWindow { x: 10.0, y: 20.0, width: 900.0, height: 600.0, maximized: true }),
+            font_size: Some(16.0),
         };
         save(&path, &cfg).unwrap();
         assert_eq!(load(&path), cfg);

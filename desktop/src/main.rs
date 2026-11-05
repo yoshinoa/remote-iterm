@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod clipboard;
 mod config;
 mod connection;
 mod geometry;
@@ -25,7 +26,11 @@ fn main() {
         };
         let options = WindowOptions {
             window_bounds: Some(window_bounds),
-            titlebar: Some(TitlebarOptions { title: Some("Remote iTerm".into()), ..Default::default() }),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Remote iTerm".into()),
+                appears_transparent: cfg!(target_os = "windows"),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let cfg = cfg.clone();

@@ -11,7 +11,7 @@ use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use base64::Engine;
 use gpui::{
-    Bounds, ClipboardEntry, DispatchPhase, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    App, Bounds, Hsla, WindowControlArea, ClipboardEntry, DispatchPhase, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, WindowBounds, ScrollDelta, ScrollWheelEvent, canvas, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
     ElementInputHandler, EntityInputHandler, UTF16Selection, UniformListScrollHandle, Window, div, prelude::*, px,
     uniform_list,
@@ -39,6 +39,9 @@ pub struct RootView {
     pub(crate) scroll: UniformListScrollHandle,
     pub(crate) focus: FocusHandle,
     pub(crate) cell_width: Pixels,
+    pub(crate) font_size: f32,
+    pub(crate) custom_titlebar: bool,
+    zoom_accum: f32,
     pub(crate) connected: bool,
     pub(crate) ever_connected: bool,
     pub(crate) auth_rejected: bool,
@@ -51,22 +54,20 @@ pub struct RootView {
     pub(crate) config_path: PathBuf,
     pub(crate) clip_status: Option<bool>,
     connector: Connector,
+    pub(crate) bitmap_reader: fn() -> Option<gpui::Image>,
     key_input: String,
     marked: Option<String>,
     clip_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
+    zoom_save_task: Option<Task<()>>,
     events_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
 }
 
 impl RootView {
     fn build(config: Config, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let text_system = window.text_system();
-        let font_id = text_system.resolve_font(&theme::terminal_font(false));
-        let cell_width = text_system
-            .advance(font_id, px(theme::FONT_SIZE), 'M')
-            .map(|size| size.width)
-            .unwrap_or(px(theme::FONT_SIZE * 0.6));
+        let font_size = config.font_size.unwrap_or(theme::FONT_SIZE).clamp(theme::MIN_FONT_SIZE, theme::MAX_FONT_SIZE);
+        let cell_width = Self::measure_cell(font_size, cx);
         let focus = cx.focus_handle();
         window.focus(&focus);
         let view = Self {
@@ -77,6 +78,9 @@ impl RootView {
             scroll: UniformListScrollHandle::new(),
             focus,
             cell_width,
+            font_size,
+            custom_titlebar: cfg!(target_os = "windows"),
+            zoom_accum: 0.0,
             connected: false,
             ever_connected: false,
             auth_rejected: false,
@@ -89,10 +93,12 @@ impl RootView {
             config_path: config::config_path(),
             clip_status: None,
             connector: connection::start,
+            bitmap_reader: crate::clipboard::read_bitmap,
             key_input: String::new(),
             marked: None,
             clip_task: None,
             save_task: None,
+            zoom_save_task: None,
             events_task: None,
             tick_task: None,
         };
@@ -121,8 +127,50 @@ impl RootView {
             let (handle, _) = ConnHandle::recording();
             (handle, futures::channel::mpsc::unbounded().1)
         };
+        view.bitmap_reader = || None;
         view.attach(handle, events, cx);
         view
+    }
+
+    fn measure_cell(font_size: f32, cx: &App) -> Pixels {
+        let text_system = cx.text_system();
+        let font_id = text_system.resolve_font(&theme::terminal_font(false));
+        text_system
+            .advance(font_id, px(font_size), 'M')
+            .map(|size| size.width)
+            .unwrap_or(px(font_size * 0.6))
+    }
+
+    pub(crate) fn line_height(&self) -> f32 {
+        theme::line_height(self.font_size)
+    }
+
+    fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        let size = size.clamp(theme::MIN_FONT_SIZE, theme::MAX_FONT_SIZE);
+        if size == self.font_size {
+            return;
+        }
+        let bottom = self.at_bottom();
+        self.font_size = size;
+        self.cell_width = Self::measure_cell(size, cx);
+        if bottom {
+            self.scroll_to_bottom();
+        }
+        let path = self.config_path.clone();
+        self.zoom_save_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(Duration::from_millis(500)).await;
+            let _ = config::remember_font_size(&path, size);
+        }));
+        cx.notify();
+    }
+
+    fn zoom_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        self.zoom_accum += self.wheel_lines(event);
+        let steps = self.zoom_accum.trunc();
+        if steps != 0.0 {
+            self.zoom_accum -= steps;
+            self.set_font_size(self.font_size + steps, cx);
+        }
     }
 
     pub(crate) fn key_screen_visible(&self) -> bool {
@@ -296,7 +344,7 @@ impl RootView {
                         let added = usize::try_from(before - after).unwrap_or(0);
                         if added > 0 {
                             let offset = -f32::from(self.scroll.0.borrow().base_handle.offset().y);
-                            let top = (offset / theme::LINE_HEIGHT).floor().max(0.0) as usize;
+                            let top = (offset / self.line_height()).floor().max(0.0) as usize;
                             self.scroll.scroll_to_item(top + added, ScrollStrategy::Top);
                         }
                     }
@@ -409,6 +457,8 @@ impl RootView {
                 _ => None,
             })
         });
+        let text = item.and_then(|item| item.text()).filter(|text| !text.is_empty());
+        let image = image.or_else(|| if text.is_none() { (self.bitmap_reader)() } else { None });
         if let Some(image) = image {
             let data = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
             if let Some(conn) = &self.conn {
@@ -418,9 +468,8 @@ impl RootView {
             cx.notify();
             return;
         }
-        match item.and_then(|item| item.text()).filter(|text| !text.is_empty()) {
-            Some(text) => self.send_to_terminal(&paste_sequence(&text), None, cx),
-            None => self.send_to_terminal("\x16", None, cx),
+        if let Some(text) = text {
+            self.send_to_terminal(&paste_sequence(&text), None, cx);
         }
     }
 
@@ -442,7 +491,7 @@ impl RootView {
             f32::from(position.x - bounds.origin.x),
             f32::from(position.y - bounds.origin.y),
             f32::from(self.cell_width),
-            theme::LINE_HEIGHT,
+            self.line_height(),
             f32::from(scroll_top),
             content.first_line,
         ))
@@ -563,10 +612,10 @@ impl RootView {
         self.scroll.0.borrow().base_handle.offset().y >= px(-1.0)
     }
 
-    fn wheel_lines(event: &ScrollWheelEvent) -> f32 {
+    fn wheel_lines(&self, event: &ScrollWheelEvent) -> f32 {
         match event.delta {
             ScrollDelta::Lines(delta) => delta.y,
-            ScrollDelta::Pixels(delta) => f32::from(delta.y) / theme::LINE_HEIGHT,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.line_height(),
         }
     }
 
@@ -577,7 +626,7 @@ impl RootView {
         let Some(at) = self.cell_at(event.position).and_then(|c| self.report_cell(c)) else {
             return true;
         };
-        self.wheel_accum += Self::wheel_lines(event);
+        self.wheel_accum += self.wheel_lines(event);
         while self.wheel_accum >= 1.0 {
             self.wheel_accum -= 1.0;
             self.send_raw(&sgr(WHEEL_UP, at.0, at.1, false));
@@ -596,7 +645,7 @@ impl RootView {
         if content.mouse {
             return;
         }
-        if Self::wheel_lines(event) > 0.0
+        if self.wheel_lines(event) > 0.0
             && self.at_top()
             && content.first_line > content.available_first_line
             && self.history_pending.is_none()
@@ -617,6 +666,19 @@ impl RootView {
         }
         let keystroke = &event.keystroke;
         let m = keystroke.modifiers;
+        if m.control && !m.alt && !m.platform {
+            let zoom = match keystroke.key.as_str() {
+                "=" | "+" => Some(self.font_size + 1.0),
+                "-" if !m.shift => Some(self.font_size - 1.0),
+                "0" if !m.shift => Some(theme::FONT_SIZE),
+                _ => None,
+            };
+            if let Some(size) = zoom {
+                self.set_font_size(size, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         let plain_ctrl = m.control && !m.alt && !m.platform && !m.shift;
         if m.control && m.shift && !m.alt && !m.platform && keystroke.key == "c" {
             self.copy_selection(cx);
@@ -672,7 +734,64 @@ impl RootView {
         cx.stop_propagation();
     }
 
-    fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_window_buttons(&self, window: &Window) -> impl IntoElement {
+        let button = |id: &'static str, glyph: &'static str, area: WindowControlArea, hover: Hsla| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .occlude()
+                .window_control_area(area)
+                .w(px(46.0))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family("Segoe MDL2 Assets")
+                .text_size(px(10.0))
+                .text_color(theme::color(theme::TEXT))
+                .hover(move |d| d.bg(hover).text_color(gpui::white()))
+                .child(glyph)
+        };
+        let subtle = gpui::rgba(0xffffff1a).into();
+        let maximize = if window.is_maximized() { "\u{E923}" } else { "\u{E922}" };
+        div()
+            .flex()
+            .flex_row()
+            .h_full()
+            .child(button("window-min", "\u{E921}", WindowControlArea::Min, subtle))
+            .child(button("window-max", maximize, WindowControlArea::Max, subtle))
+            .child(button("window-close", "\u{E8BB}", WindowControlArea::Close, theme::color(theme::CLOSE_HOVER)))
+    }
+
+    fn render_drag_area(&self, window: &Window) -> impl IntoElement {
+        let resize_strip = !window.is_maximized();
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .when(resize_strip, |d| d.child(div().h(px(4.0)).flex_none()))
+            .child(
+                div()
+                    .id("titlebar-drag")
+                    .debug_selector(|| "titlebar-drag".into())
+                    .flex_1()
+                    .when(self.custom_titlebar, |d| d.window_control_area(WindowControlArea::Drag)),
+            )
+    }
+
+    fn render_tab_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.key_screen_visible() {
+            return div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .h(px(theme::TITLEBAR_HEIGHT))
+                .bg(theme::color(theme::BAR))
+                .child(self.render_drag_area(window))
+                .child(self.render_window_buttons(window))
+                .into_any_element();
+        }
         let chip = |id: SharedString, active: bool| {
             div()
                 .id(id)
@@ -739,8 +858,9 @@ impl RootView {
             .flex_none()
             .items_center()
             .gap_1()
-            .px_2()
-            .py_1()
+            .pl_2()
+            .h(px(theme::TITLEBAR_HEIGHT))
+            .when(!self.custom_titlebar, |d| d.pr_2())
             .bg(theme::color(theme::BAR))
             .border_b_1()
             .border_color(theme::color(theme::BORDER));
@@ -761,6 +881,7 @@ impl RootView {
         for (index, id, tab_id, title) in tabs {
             let active = selected.as_deref() == Some(id.as_str());
             let mut tab = chip(format!("tab-{index}").into(), active)
+                .debug_selector(move || format!("tab-{index}"))
                 .max_w(px(260.0))
                 .child(div().overflow_hidden().text_ellipsis().child(title))
                 .on_click(cx.listener(move |view, _, _, cx| {
@@ -797,7 +918,7 @@ impl RootView {
                     }
                 })),
         );
-        bar = bar.child(div().flex_1());
+        bar = bar.child(self.render_drag_area(window));
         if panes.len() > 1 {
             for (number, id, label) in panes {
                 let active = shown.as_deref() == Some(id.as_str());
@@ -820,6 +941,8 @@ impl RootView {
                 .child(clip_label)
                 .on_click(cx.listener(|view, _, _, cx| view.copy_mac_clipboard(cx))),
         )
+        .when(self.custom_titlebar, |d| d.child(div().w(px(6.0))).child(self.render_window_buttons(window)))
+        .into_any_element()
     }
 
     fn render_key_screen(&self) -> impl IntoElement {
@@ -925,8 +1048,8 @@ impl RootView {
             .bg(bg)
             .px(px(theme::TEXT_PADDING))
             .font_family(theme::font_family())
-            .text_size(px(theme::FONT_SIZE))
-            .line_height(px(theme::LINE_HEIGHT))
+            .text_size(px(self.font_size))
+            .line_height(px(self.line_height()))
             .text_color(fg)
             .child(
                 div()
@@ -945,6 +1068,10 @@ impl RootView {
                                         return;
                                     }
                                     if weak.update(cx, |view, cx| {
+                                        if event.modifiers.control {
+                                            view.zoom_wheel(event, cx);
+                                            return true;
+                                        }
                                         let handled = view.forward_wheel(event);
                                         if handled {
                                             cx.notify();
@@ -972,6 +1099,7 @@ impl RootView {
                         let style = TermStyle {
                             fg: theme::parse_hex(&content.fg).unwrap_or(theme::color(theme::TEXT)),
                             cell_width: view.cell_width,
+                            line_height: px(view.line_height()),
                             cursor: theme::color(theme::ACCENT),
                             selection: theme::color(theme::SELECTION),
                         };
@@ -1012,9 +1140,10 @@ impl RootView {
 }
 
 impl Render for RootView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let key_screen = self.key_screen_visible();
         let reconnecting = !key_screen && self.ever_connected && !self.connected;
+        let show_bar = !key_screen || self.custom_titlebar;
         div()
             .relative()
             .size_full()
@@ -1033,10 +1162,18 @@ impl Render for RootView {
                 .absolute()
                 .size_full()
             })
-            .child(self.render_tab_bar(cx))
-            .child(self.render_terminal(cx))
-            .when(reconnecting, |d| d.child(self.render_reconnecting(cx)))
-            .when(key_screen, |d| d.child(self.render_key_screen()))
+            .when(show_bar, |d| d.child(self.render_tab_bar(window, cx)))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_terminal(cx))
+                    .when(reconnecting, |d| d.child(self.render_reconnecting(cx)))
+                    .when(key_screen, |d| d.child(self.render_key_screen())),
+            )
     }
 }
 
@@ -1112,12 +1249,13 @@ impl EntityInputHandler for RootView {
         let (line, col) = self.predictor.cursor().or_else(|| content.cursor())?;
         let scroll_top = -self.scroll.0.borrow().base_handle.offset().y;
         let row = (line - content.first_line) as f32;
+        let line_height = self.line_height();
         Some(Bounds::new(
             gpui::point(
                 area.origin.x + self.cell_width * col as f32,
-                area.origin.y + px(row * theme::LINE_HEIGHT) - scroll_top,
+                area.origin.y + px(row * line_height) - scroll_top,
             ),
-            gpui::size(self.cell_width, px(theme::LINE_HEIGHT)),
+            gpui::size(self.cell_width, px(line_height)),
         ))
     }
 
