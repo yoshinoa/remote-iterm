@@ -28,6 +28,26 @@ If the build can't find the shader compiler (`fxc.exe`), run it from the
 **Developer PowerShell for VS 2022** shortcut, which puts the SDK tools on
 `PATH`.
 
+### Installer
+
+To build a setup program instead of a bare exe, install
+[cargo-packager](https://github.com/crabnebula-dev/cargo-packager) once, then
+package from this folder:
+
+```powershell
+cargo install cargo-packager --locked
+cargo packager --release
+```
+
+This builds the app and writes `target\release\remote-iterm_0.1.0_x64-setup.exe`.
+The first run downloads the NSIS installer tools, so it needs the internet.
+
+The installer doesn't need admin rights. It installs to
+`%LOCALAPPDATA%\Remote iTerm`, adds a Start menu entry and, if you tick the box
+on the last page, a desktop shortcut. To update, run a newer installer over
+the old one. To remove the app, use **Settings → Apps**. Your settings in
+`%APPDATA%\remote-iterm` are kept either way.
+
 ## First run
 
 The app opens on an access-key screen. Paste the server's QR link (the

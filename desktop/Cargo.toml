@@ -3,9 +3,20 @@ name = "remote-iterm-desktop"
 version = "0.1.0"
 edition = "2024"
 
+description = "Native window for the remote-iterm server"
+
 [[bin]]
 name = "remote-iterm"
 path = "src/main.rs"
+
+[package.metadata.packager]
+product-name = "Remote iTerm"
+identifier = "ca.jiye.remote-iterm.desktop"
+before-packaging-command = "cargo build --release"
+formats = ["nsis"]
+
+[package.metadata.packager.nsis]
+installer-icon = "assets/icon.ico"
 
 [dependencies]
 gpui = "=0.2.2"
