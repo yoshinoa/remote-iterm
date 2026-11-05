@@ -483,3 +483,30 @@ fn history_request_is_not_stuck_after_switching_or_reconnecting(cx: &mut TestApp
     let requests = h.sent().into_iter().filter(|(e, _)| e == "getEarlierContent").count();
     assert_eq!(requests, 1, "history should be requested again after reconnecting");
 }
+
+#[gpui::test]
+fn ime_composition_is_sent_once_when_committed(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+    let mut h = ready(cx);
+    let view = h.view.clone();
+    h.cx.update(|window, cx| view.update(cx, |v, cx| v.replace_and_mark_text_in_range(None, "ni", None, window, cx)));
+    assert!(keys_sent(&h.sent()).is_empty());
+    h.cx.update(|window, cx| view.update(cx, |v, cx| v.replace_text_in_range(None, "你好", window, cx)));
+    assert_eq!(keys_sent(&h.sent()), vec!["你好"]);
+    let marked = h.cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+    assert_eq!(marked, None);
+}
+
+#[gpui::test]
+fn altgr_character_is_typed_through_text_input(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.simulate_keystrokes("ctrl-alt-q->@ q->é");
+    assert_eq!(keys_sent(&h.sent()), vec!["@", "é"]);
+}
+
+#[gpui::test]
+fn printable_keys_reach_the_terminal_through_text_input_only_once(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    h.cx.simulate_keystrokes("h shift-i space");
+    assert_eq!(keys_sent(&h.sent()), vec!["h", "I", " "]);
+}

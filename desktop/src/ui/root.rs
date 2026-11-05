@@ -13,9 +13,11 @@ use base64::Engine;
 use gpui::{
     Bounds, ClipboardEntry, DispatchPhase, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, WindowBounds, ScrollDelta, ScrollWheelEvent, canvas, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
-    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    ElementInputHandler, EntityInputHandler, UTF16Selection, UniformListScrollHandle, Window, div, prelude::*, px,
+    uniform_list,
 };
 use std::cell::Cell;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -50,6 +52,7 @@ pub struct RootView {
     pub(crate) clip_status: Option<bool>,
     connector: Connector,
     key_input: String,
+    marked: Option<String>,
     clip_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
     events_task: Option<Task<()>>,
@@ -87,6 +90,7 @@ impl RootView {
             clip_status: None,
             connector: connection::start,
             key_input: String::new(),
+            marked: None,
             clip_task: None,
             save_task: None,
             events_task: None,
@@ -345,6 +349,26 @@ impl RootView {
         match (predict, self.model.shown()) {
             (Some(key), Some(screen)) => self.predictor.on_key(&session, key, screen, Instant::now()),
             _ => self.predictor.reset(),
+        }
+        self.scroll_to_bottom();
+        self.ensure_tick(cx);
+        cx.notify();
+    }
+
+    fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(session) = self.model.session_id.clone() else {
+            return;
+        };
+        if let Some(conn) = &self.conn {
+            conn.send_keys(&session, text);
+        }
+        self.selection = None;
+        let now = Instant::now();
+        for ch in text.chars() {
+            match self.model.shown() {
+                Some(screen) if !ch.is_control() => self.predictor.on_key(&session, PredictKey::Char(ch), screen, now),
+                _ => self.predictor.reset(),
+            }
         }
         self.scroll_to_bottom();
         self.ensure_tick(cx);
@@ -617,6 +641,15 @@ impl RootView {
                 cx.stop_propagation();
                 return;
             }
+        }
+        let typed_char = keystroke
+            .key_char
+            .as_deref()
+            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control));
+        let plain = !m.control && !m.alt && !m.platform;
+        let altgr = m.control && m.alt && !m.platform;
+        if typed_char.is_some() && (plain || altgr) {
+            return;
         }
         let input = KeyInput {
             key: &keystroke.key,
@@ -990,9 +1023,110 @@ impl Render for RootView {
             .bg(theme::color(theme::BACKGROUND))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            .child({
+                let entity = cx.entity();
+                let focus = self.focus.clone();
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, cx| window.handle_input(&focus, ElementInputHandler::new(bounds, entity), cx),
+                )
+                .absolute()
+                .size_full()
+            })
             .child(self.render_tab_bar(cx))
             .child(self.render_terminal(cx))
             .when(reconnecting, |d| d.child(self.render_reconnecting(cx)))
             .when(key_screen, |d| d.child(self.render_key_screen()))
+    }
+}
+
+impl EntityInputHandler for RootView {
+    fn text_for_range(
+        &mut self,
+        _range: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection { range: 0..0, reversed: false })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked.as_ref().map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.marked = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = None;
+        if text.is_empty() {
+            return;
+        }
+        if self.key_screen_visible() {
+            self.key_input.push_str(text);
+            cx.notify();
+            return;
+        }
+        self.type_text(text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = (!new_text.is_empty()).then(|| new_text.to_string());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let area = self.term_bounds.get()?;
+        let content = self.model.shown()?;
+        let (line, col) = self.predictor.cursor().or_else(|| content.cursor())?;
+        let scroll_top = -self.scroll.0.borrow().base_handle.offset().y;
+        let row = (line - content.first_line) as f32;
+        Some(Bounds::new(
+            gpui::point(
+                area.origin.x + self.cell_width * col as f32,
+                area.origin.y + px(row * theme::LINE_HEIGHT) - scroll_top,
+            ),
+            gpui::size(self.cell_width, px(theme::LINE_HEIGHT)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
