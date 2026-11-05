@@ -252,6 +252,24 @@ async fn wait_for_retry(delay: Duration, cmds: &mut tmpsc::UnboundedReceiver<Com
     }
 }
 
+enum Control {
+    Retry,
+    Shutdown,
+}
+
+async fn next_control(cmds: &mut tmpsc::UnboundedReceiver<Command>) -> Control {
+    loop {
+        match cmds.recv().await {
+            None | Some(Command::Shutdown) => return Control::Shutdown,
+            Some(Command::ReconnectNow) => return Control::Retry,
+            Some(Command::Ack { reply, .. }) => {
+                let _ = reply.send(None);
+            }
+            Some(Command::Emit { .. }) => {}
+        }
+    }
+}
+
 async fn supervise(
     url: String,
     key: String,
@@ -262,8 +280,20 @@ async fn supervise(
     loop {
         let (link_tx, mut link_rx) = tmpsc::unbounded_channel();
         let mut auth_rejected = false;
-        match builder(&url, &key, link_tx.clone()).connect().await {
-            Ok(client) => {
+        let attempt = tokio::select! {
+            result = tokio::time::timeout(CONNECT_TIMEOUT, builder(&url, &key, link_tx.clone()).connect()) => {
+                result.ok().and_then(Result::ok)
+            }
+            control = next_control(&mut cmds) => match control {
+                Control::Shutdown => return,
+                Control::Retry => {
+                    delay = Duration::ZERO;
+                    None
+                }
+            },
+        };
+        match attempt {
+            Some(client) => {
                 let outcome = run_session(&client, &mut cmds, &mut link_rx, &link_tx, &events).await;
                 let _ = client.disconnect().await;
                 match outcome {
@@ -278,14 +308,14 @@ async fn supervise(
                     }
                 }
             }
-            Err(_) => {
+            None => {
                 let _ = events.unbounded_send(ServerEvent::Disconnected);
             }
         }
         if !wait_for_retry(delay, &mut cmds, auth_rejected).await {
             return;
         }
-        delay = (delay * 2).min(BACKOFF_MAX);
+        delay = (delay * 2).clamp(BACKOFF_MIN, BACKOFF_MAX);
     }
 }
 
@@ -389,6 +419,40 @@ mod tests {
         assert_eq!(ack_value(&Payload::from("[123]".to_string())), Some(json!(123)));
         assert_eq!(ack_value(&Payload::from("[\"copied\"]".to_string())), Some(json!("copied")));
         assert_eq!(ack_value(&Payload::from("[]".to_string())), None);
+    }
+
+    fn black_hole() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_prompt_while_a_connect_hangs() {
+        let (handle, mut events) = start(black_hole(), "key".into());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.shutdown();
+        let ended = tokio::time::timeout(Duration::from_secs(2), async {
+            while events.next().await.is_some() {}
+        })
+        .await;
+        assert!(ended.is_ok(), "connection thread ignored shutdown during a hung connect");
+    }
+
+    #[tokio::test]
+    async fn retry_now_interrupts_a_hung_connect() {
+        let (handle, mut events) = start(black_hole(), "key".into());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.reconnect_now();
+        let got = tokio::time::timeout(Duration::from_secs(2), events.next()).await;
+        assert!(matches!(got, Ok(Some(ServerEvent::Disconnected))), "retry did not abandon the hung attempt: {got:?}");
+        handle.shutdown();
     }
 
     #[test]
