@@ -816,9 +816,9 @@ impl RootView {
                 .children(self.render_resize_strip(window))
                 .into_any_element();
         }
-        let chip = |id: SharedString, active: bool| {
+        let slot = |id: SharedString| div().id(id).h_full().flex().items_center().cursor_pointer();
+        let pill = |active: bool| {
             div()
-                .id(id)
                 .flex()
                 .flex_row()
                 .items_center()
@@ -827,7 +827,6 @@ impl RootView {
                 .py_1()
                 .rounded_md()
                 .text_size(px(12.0))
-                .cursor_pointer()
                 .whitespace_nowrap()
                 .text_color(theme::color(if active { theme::ACCENT } else { theme::MUTED }))
                 .when(active, |d| d.bg(theme::color(theme::BORDER)))
@@ -870,10 +869,10 @@ impl RootView {
         if windows.len() > 1 {
             for (number, id, active) in windows {
                 bar = bar.child(
-                    chip(format!("window-{number}").into(), active)
+                    slot(format!("window-{number}").into())
                         .debug_selector(move || format!("window-{number}"))
                         .flex_none()
-                        .child(format!("W{number}"))
+                        .child(pill(active).child(format!("W{number}")))
                         .on_click(cx.listener(move |view, _, _, cx| {
                             let effects = view.model.select_window(&id);
                             view.apply_effects(effects, cx);
@@ -882,25 +881,18 @@ impl RootView {
             }
             bar = bar.child(div().flex_none().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::color(theme::BORDER)));
         }
-        let mut strip = div().flex().flex_row().items_center().gap_1().flex_initial().min_w(px(0.0)).overflow_hidden();
+        let mut strip =
+            div().h_full().flex().flex_row().items_center().gap_1().flex_initial().min_w(px(0.0)).overflow_hidden();
         for (index, id, tab_id, title) in tabs {
             let active = selected.as_deref() == Some(id.as_str());
             let dragged = DraggedTab { tab_id: tab_id.clone(), title: title.clone() };
-            let mut tab = chip(format!("tab-{index}").into(), active)
-                .debug_selector(move || format!("tab-{index}"))
-                .min_w(px(theme::TAB_MIN_WIDTH))
-                .max_w(px(260.0))
+            let mut label = pill(active)
+                .flex_1()
+                .min_w(px(0.0))
                 .overflow_hidden()
-                .child(div().flex_1().min_w(px(0.0)).overflow_hidden().text_ellipsis().child(title))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    let effects = view.model.select_tab(&id);
-                    view.apply_effects(effects, cx);
-                }))
-                .on_drag(dragged, |dragged: &DraggedTab, _, _, cx| cx.new(|_| dragged.clone()))
-                .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::color(theme::SELECTION)))
-                .on_drop(cx.listener(move |view, dragged: &DraggedTab, _, _| view.move_tab(&dragged.tab_id, index)));
+                .child(div().flex_1().min_w(px(0.0)).overflow_hidden().text_ellipsis().child(title));
             if total_tabs > 1 {
-                tab = tab.child(
+                label = label.child(
                     div()
                         .id(SharedString::from(format!("close-tab-{index}")))
                         .debug_selector(move || format!("close-tab-{index}"))
@@ -918,13 +910,26 @@ impl RootView {
                         })),
                 );
             }
+            let tab = slot(format!("tab-{index}").into())
+                .debug_selector(move || format!("tab-{index}"))
+                .min_w(px(theme::TAB_MIN_WIDTH))
+                .max_w(px(260.0))
+                .overflow_hidden()
+                .child(label)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    let effects = view.model.select_tab(&id);
+                    view.apply_effects(effects, cx);
+                }))
+                .on_drag(dragged, |dragged: &DraggedTab, _, _, cx| cx.new(|_| dragged.clone()))
+                .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::color(theme::SELECTION)))
+                .on_drop(cx.listener(move |view, dragged: &DraggedTab, _, _| view.move_tab(&dragged.tab_id, index)));
             strip = strip.child(tab);
         }
         bar = bar.child(strip).child(
-            chip("new-tab".into(), false)
+            slot("new-tab".into())
                 .debug_selector(|| "new-tab".into())
                 .flex_none()
-                .child("+")
+                .child(pill(false).child("+"))
                 .on_click(cx.listener(|view, _, _, _| {
                     if let Some(conn) = &view.conn {
                         conn.new_tab();
@@ -936,10 +941,10 @@ impl RootView {
             for (number, id, label) in panes {
                 let active = shown.as_deref() == Some(id.as_str());
                 bar = bar.child(
-                    chip(format!("pane-{number}").into(), active)
+                    slot(format!("pane-{number}").into())
                         .debug_selector(move || format!("pane-{number}"))
                         .flex_none()
-                        .child(label)
+                        .child(pill(active).child(label))
                         .on_click(cx.listener(move |view, _, _, cx| {
                             let effects = view.model.select_session(&id);
                             view.apply_effects(effects, cx);
