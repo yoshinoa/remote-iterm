@@ -1173,6 +1173,7 @@ impl RootView {
             .min_h_0()
             .bg(bg)
             .px(px(theme::TEXT_PADDING))
+            .pb(px(theme::TEXT_PADDING))
             .font_family(theme::font_family())
             .text_size(px(self.font_size))
             .line_height(px(self.line_height()))
