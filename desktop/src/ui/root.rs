@@ -731,6 +731,13 @@ impl RootView {
                 cx.stop_propagation();
                 return;
             }
+            if keystroke.key == "w" {
+                if let (Some(conn), Some(tab)) = (&self.conn, self.model.current_tab()) {
+                    conn.close_tab(&tab.tab_id);
+                }
+                cx.stop_propagation();
+                return;
+            }
         }
         let typed_char = keystroke
             .key_char

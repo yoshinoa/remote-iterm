@@ -152,9 +152,9 @@ fn overlay(h: &Harness) -> Vec<(i64, usize, char)> {
 #[gpui::test]
 fn typed_keys_are_sent_in_order(cx: &mut TestAppContext) {
     let mut h = ready(cx);
-    h.cx.simulate_keystrokes("a b ctrl-w enter backspace up");
+    h.cx.simulate_keystrokes("a b ctrl-r enter backspace up");
     let sent = h.sent();
-    assert_eq!(keys_sent(&sent), vec!["a", "b", "\x17", "\r", "\x7f", "\x1b[A"]);
+    assert_eq!(keys_sent(&sent), vec!["a", "b", "\x12", "\r", "\x7f", "\x1b[A"]);
 }
 
 #[gpui::test]
