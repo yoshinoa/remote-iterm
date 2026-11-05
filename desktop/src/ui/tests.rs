@@ -459,3 +459,27 @@ fn mac_clipboard_button_reports_nothing_to_copy(cx: &mut TestAppContext) {
     assert_eq!(h.cx.read_from_clipboard(), None);
     assert_eq!(h.view.read_with(h.cx, |v, _| v.clip_status), Some(false));
 }
+
+#[gpui::test]
+fn history_request_is_not_stuck_after_switching_or_reconnecting(cx: &mut TestAppContext) {
+    let mut h = ready(cx);
+    let at = cell_point(&mut h, 0, 0);
+    wheel(&mut h, at, 3.0);
+    h.cx.simulate_keystrokes("ctrl-2");
+    h.cx.simulate_keystrokes("ctrl-1");
+    h.send(ServerEvent::Content(prompt("s1", "")));
+    h.sent();
+    let at = cell_point(&mut h, 0, 0);
+    wheel(&mut h, at, 3.0);
+    let requests = h.sent().into_iter().filter(|(e, _)| e == "getEarlierContent").count();
+    assert_eq!(requests, 1, "history should be requested again after switching back");
+
+    h.send(ServerEvent::Disconnected);
+    h.send(ServerEvent::Connected);
+    h.send(ServerEvent::Content(prompt("s1", "")));
+    h.sent();
+    let at = cell_point(&mut h, 0, 0);
+    wheel(&mut h, at, 3.0);
+    let requests = h.sent().into_iter().filter(|(e, _)| e == "getEarlierContent").count();
+    assert_eq!(requests, 1, "history should be requested again after reconnecting");
+}

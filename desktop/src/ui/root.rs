@@ -254,11 +254,15 @@ impl RootView {
         match event {
             ServerEvent::Connected => {
                 self.connected = true;
+                self.history_pending = None;
                 self.ever_connected = true;
                 let effects = self.model.on_connected();
                 self.apply_effects(effects, cx);
             }
-            ServerEvent::Disconnected => self.connected = false,
+            ServerEvent::Disconnected => {
+                self.connected = false;
+                self.history_pending = None;
+            }
             ServerEvent::AuthRejected => {
                 self.connected = false;
                 self.auth_rejected = true;
@@ -304,6 +308,7 @@ impl RootView {
             match effect {
                 Effect::ResetPrediction => {
                     self.predictor.reset();
+                    self.history_pending = None;
                     switched = true;
                 }
                 Effect::Watch(ids) => {
