@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -192,47 +193,36 @@ class BoundedDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending_events["other"], {})
 
 
-class _FakeStreamer:
-    def __init__(self, notifications: asyncio.Queue):
-        self.notifications = notifications
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    async def async_get(self):
-        return await self.notifications.get()
-
-
-class _FakeStreamSession:
-    def __init__(self):
-        self.notifications = asyncio.Queue()
-
-    def get_screen_streamer(self, want_contents=False):
-        return _FakeStreamer(self.notifications)
-
-
 class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
     INTERVAL = 0.2
 
     async def asyncSetUp(self):
-        self.session = _FakeStreamSession()
         self.sent: list[float] = []
         self.reads = 0
+        self.changed: asyncio.Event | None = None
+        self.during_read = None
         loop = asyncio.get_running_loop()
 
         async def fake_read_content(session_id):
             self.reads += 1
+            if self.during_read is not None:
+                hook, self.during_read = self.during_read, None
+                hook()
+            await asyncio.sleep(0.005)
             return {"lines": [[{"t": str(self.reads)}]]}
 
+        @contextlib.asynccontextmanager
+        async def fake_screen_updates(session_id):
+            self.changed = asyncio.Event()
+            yield self.changed
+
         app = mock.Mock()
-        app.get_session_by_id.return_value = self.session
+        app.get_session_by_id.return_value = object()
         clients.add("watching")
         self.patches = [
             mock.patch.object(server_module, "itermapp", app),
             mock.patch.object(server_module, "read_content", fake_read_content),
+            mock.patch.object(server_module, "screen_updates", fake_screen_updates),
             mock.patch.object(server_module, "queue_content_for_watchers",
                               lambda sid, content: self.sent.append(loop.time())),
             mock.patch.object(server_module, "STREAM_MIN_INTERVAL", self.INTERVAL),
@@ -240,7 +230,7 @@ class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.start()
         self.task = asyncio.create_task(server_module.stream_session("session-1"))
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.02)
 
     async def asyncTearDown(self):
         self.task.cancel()
@@ -250,37 +240,47 @@ class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
         clients.clear()
         server_module.keystroke_at.clear()
 
+    def notify(self):
+        self.changed.set()
+
     async def test_first_change_after_a_quiet_spell_is_sent_immediately(self):
         await asyncio.sleep(self.INTERVAL * 1.5)
         before = len(self.sent)
         changed_at = asyncio.get_running_loop().time()
-        self.session.notifications.put_nowait(None)
+        self.notify()
         await asyncio.sleep(self.INTERVAL / 4)
 
         self.assertEqual(len(self.sent), before + 1)
         self.assertLess(self.sent[-1] - changed_at, self.INTERVAL / 4)
 
-    async def test_a_burst_of_changes_is_spaced_by_the_min_interval(self):
+    async def test_a_burst_of_changes_is_coalesced_and_spaced(self):
         await asyncio.sleep(self.INTERVAL * 1.5)
         before = len(self.sent)
         for _ in range(3):
-            self.session.notifications.put_nowait(None)
-            await asyncio.sleep(0.01)
+            self.notify()
+            await asyncio.sleep(0.03)
         await asyncio.sleep(self.INTERVAL * 3.5)
 
         burst = self.sent[before:]
-        self.assertEqual(len(burst), 3)
-        for earlier, later in zip(burst, burst[1:]):
-            self.assertGreaterEqual(later - earlier, self.INTERVAL * 0.95)
+        self.assertEqual(len(burst), 2)
+        self.assertGreaterEqual(burst[1] - burst[0], self.INTERVAL * 0.95)
+
+    async def test_change_during_a_read_is_not_lost(self):
+        await asyncio.sleep(self.INTERVAL * 1.5)
+        before = len(self.sent)
+        self.during_read = self.notify
+        self.notify()
+        await asyncio.sleep(self.INTERVAL * 1.75)
+        self.assertEqual(len(self.sent), before + 2)
 
     async def test_change_soon_after_a_keystroke_skips_the_wait(self):
         await asyncio.sleep(self.INTERVAL * 1.5)
-        self.session.notifications.put_nowait(None)
-        await asyncio.sleep(0.01)
+        self.notify()
+        await asyncio.sleep(0.02)
         server_module.note_keystroke("session-1")
         before = len(self.sent)
         changed_at = asyncio.get_running_loop().time()
-        self.session.notifications.put_nowait(None)
+        self.notify()
         await asyncio.sleep(self.INTERVAL / 4)
         self.assertEqual(len(self.sent), before + 1)
         self.assertLess(self.sent[-1] - changed_at, self.INTERVAL / 4)
@@ -288,12 +288,12 @@ class StreamThrottleTest(unittest.IsolatedAsyncioTestCase):
     async def test_keystroke_window_expires(self):
         with mock.patch.object(server_module, "KEYSTROKE_WINDOW", 0.05):
             await asyncio.sleep(self.INTERVAL * 1.5)
-            self.session.notifications.put_nowait(None)
-            await asyncio.sleep(0.01)
+            self.notify()
+            await asyncio.sleep(0.02)
             first = self.sent[-1]
             server_module.note_keystroke("session-1")
             await asyncio.sleep(0.08)
-            self.session.notifications.put_nowait(None)
+            self.notify()
             await asyncio.sleep(self.INTERVAL * 1.5)
         self.assertGreaterEqual(self.sent[-1] - first, self.INTERVAL * 0.95)
 

@@ -12,6 +12,7 @@ client.
 import asyncio
 import base64
 import binascii
+import contextlib
 import ctypes
 import json
 import math
@@ -825,6 +826,24 @@ def note_keystroke(session_id: str) -> None:
     keystroke_at[session_id] = asyncio.get_running_loop().time()
 
 
+@contextlib.asynccontextmanager
+async def screen_updates(session_id: str):
+    changed = asyncio.Event()
+
+    async def on_update(_connection, _message):
+        changed.set()
+
+    token = await iterm2.notifications.async_subscribe_to_screen_update_notification(
+        connection, on_update, session_id)
+    try:
+        yield changed
+    finally:
+        try:
+            await iterm2.notifications.async_unsubscribe(connection, token)
+        except iterm2.notifications.SubscriptionException:
+            pass
+
+
 async def stream_session(session_id: str) -> None:
     session = itermapp.get_session_by_id(session_id) if itermapp else None
     if session is None:
@@ -838,17 +857,15 @@ async def stream_session(session_id: str) -> None:
     loop = asyncio.get_running_loop()
     last_read = loop.time()
     try:
-        # The first change after a quiet spell is read at once so keystroke
-        # echo isn't delayed; changes within STREAM_MIN_INTERVAL of the last
-        # read wait out the remainder, coalescing bursts of fast output.
-        async with session.get_screen_streamer(want_contents=False) as streamer:
+        async with screen_updates(session_id) as changed:
             while True:
-                await streamer.async_get()
+                await changed.wait()
                 now = loop.time()
                 wait = last_read + STREAM_MIN_INTERVAL - now
                 typed = now - keystroke_at.get(session_id, float("-inf")) <= KEYSTROKE_WINDOW
                 if wait > 0 and not typed:
                     await asyncio.sleep(wait)
+                changed.clear()
                 last_read = loop.time()
                 if not clients:
                     continue
