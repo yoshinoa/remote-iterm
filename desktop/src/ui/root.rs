@@ -975,10 +975,14 @@ impl RootView {
                         .id(SharedString::from(format!("close-tab-{index}")))
                         .debug_selector(move || format!("close-tab-{index}"))
                         .flex_none()
-                        .px_1()
+                        .size(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded_sm()
+                        .text_size(px(15.0))
                         .text_color(theme::color(theme::MUTED))
-                        .hover(|d| d.text_color(theme::color(theme::DANGER)))
+                        .hover(|d| d.bg(theme::color(theme::HOVER)).text_color(theme::color(theme::TEXT)))
                         .child("×")
                         .on_click(cx.listener(move |view, _, _, cx| {
                             if let Some(conn) = &view.conn {
@@ -1011,8 +1015,20 @@ impl RootView {
         bar = bar.child(strip).child(
             slot("new-tab".into())
                 .debug_selector(|| "new-tab".into())
+                .group("new-tab")
                 .flex_none()
-                .child(pill(false).child("+"))
+                .child(
+                    div()
+                        .size(px(26.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .text_size(px(18.0))
+                        .text_color(theme::color(theme::MUTED))
+                        .group_hover("new-tab", |d| d.bg(theme::color(theme::HOVER)).text_color(theme::color(theme::TEXT)))
+                        .child("+"),
+                )
                 .on_click(cx.listener(|view, _, _, _| {
                     if let Some(conn) = &view.conn {
                         conn.new_tab();

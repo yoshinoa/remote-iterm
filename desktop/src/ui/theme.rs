@@ -8,6 +8,7 @@ pub const TEXT: u32 = 0xd4d4d8;
 pub const MUTED: u32 = 0x71717a;
 pub const DANGER: u32 = 0xfb7185;
 pub const SELECTION: u32 = 0x1e3a8a;
+pub const HOVER: u32 = 0x3f3f46;
 pub const CLOSE_HOVER: u32 = 0xc42b1c;
 pub const TITLEBAR_HEIGHT: f32 = 34.0;
 pub const RESIZE_STRIP_HEIGHT: f32 = 4.0;
