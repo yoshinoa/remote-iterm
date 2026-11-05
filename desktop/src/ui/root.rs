@@ -11,7 +11,7 @@ use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use base64::Engine;
 use gpui::{
-    App, Bounds, Hsla, WindowControlArea, ClipboardEntry, DispatchPhase, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    App, Bounds, DragMoveEvent, Hsla, WindowControlArea, ClipboardEntry, DispatchPhase, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, WindowBounds, ScrollDelta, ScrollWheelEvent, canvas, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Task,
     ElementInputHandler, EntityInputHandler, UTF16Selection, UniformListScrollHandle, Window, div, prelude::*, px,
     uniform_list,
@@ -29,20 +29,37 @@ type Connector = fn(String, String) -> (ConnHandle, futures::channel::mpsc::Unbo
 struct DraggedTab {
     tab_id: String,
     title: SharedString,
+    width: Option<Pixels>,
 }
 
 impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .text_size(px(12.0))
-            .whitespace_nowrap()
-            .bg(theme::color(theme::BORDER))
-            .text_color(theme::color(theme::ACCENT))
-            .child(self.title.clone())
+            .h(px(theme::TITLEBAR_HEIGHT))
+            .flex()
+            .items_center()
+            .when_some(self.width, |d, width| d.w(width))
+            .child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .shadow_md()
+                    .text_size(px(12.0))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .bg(theme::color(theme::BORDER))
+                    .text_color(theme::color(theme::ACCENT))
+                    .child(self.title.clone()),
+            )
     }
+}
+
+struct TabDrag {
+    tab_id: String,
+    target: usize,
 }
 
 struct Drag {
@@ -70,6 +87,8 @@ pub struct RootView {
     selecting: bool,
     drag: Option<Drag>,
     history_pending: Option<i64>,
+    tab_drag: Option<TabDrag>,
+    tab_bounds: Rc<std::cell::RefCell<Vec<(String, Bounds<Pixels>)>>>,
     wheel_accum: f32,
     pub(crate) config_path: PathBuf,
     connector: Connector,
@@ -107,6 +126,8 @@ impl RootView {
             selecting: false,
             drag: None,
             history_pending: None,
+            tab_drag: None,
+            tab_bounds: Rc::new(std::cell::RefCell::new(Vec::new())),
             wheel_accum: 0.0,
             config_path: config::config_path(),
             connector: connection::start,
@@ -764,7 +785,6 @@ impl RootView {
     }
 
     fn render_drag_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let last = self.model.current_tabs().len() as u32;
         div()
             .id("titlebar-drag")
             .debug_selector(|| "titlebar-drag".into())
@@ -773,7 +793,7 @@ impl RootView {
             .h_full()
             .occlude()
             .when(self.custom_titlebar, |d| d.window_control_area(WindowControlArea::Drag))
-            .on_drop(cx.listener(move |view, dragged: &DraggedTab, _, _| view.move_tab(&dragged.tab_id, last)))
+            .on_drop(cx.listener(|view, _: &DraggedTab, _, cx| view.finish_tab_drag(cx)))
     }
 
     fn render_resize_strip(&self, window: &Window) -> Option<impl IntoElement> {
@@ -789,10 +809,40 @@ impl RootView {
         })
     }
 
-    fn move_tab(&mut self, tab_id: &str, to_index: u32) {
-        if let Some(conn) = &self.conn {
-            conn.move_tab(tab_id, to_index);
+    fn update_tab_drag(&mut self, tab_id: &str, x: Pixels, cx: &mut Context<Self>) {
+        let target = self
+            .tab_bounds
+            .borrow()
+            .iter()
+            .filter(|(id, bounds)| id != tab_id && bounds.center().x < x)
+            .count();
+        let changed = match &mut self.tab_drag {
+            Some(drag) if drag.tab_id == tab_id => std::mem::replace(&mut drag.target, target) != target,
+            _ => {
+                self.tab_drag = Some(TabDrag { tab_id: tab_id.to_string(), target });
+                true
+            }
+        };
+        if changed {
+            cx.notify();
         }
+    }
+
+    fn finish_tab_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag.take() else {
+            return;
+        };
+        let tabs = self.model.current_tabs();
+        if let Some(from) = tabs.iter().position(|t| t.tab_id == drag.tab_id) {
+            let to = drag.target.min(tabs.len() - 1);
+            if from != to {
+                self.model.move_tab(&drag.tab_id, to);
+                if let Some(conn) = &self.conn {
+                    conn.move_tab(&drag.tab_id, to as u32 + 1);
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn render_tab_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -840,7 +890,7 @@ impl RootView {
             .map(|(ix, w)| (ix + 1, w.id.clone(), self.model.window_id.as_deref() == Some(w.id.as_str())))
             .collect();
         let selected = self.model.tab_id.clone();
-        let tabs: Vec<(u32, String, String, SharedString)> = self
+        let mut tabs: Vec<(u32, String, String, SharedString)> = self
             .model
             .current_tabs()
             .iter()
@@ -849,6 +899,19 @@ impl RootView {
                 (t.index, t.id.clone(), t.tab_id.clone(), title.into())
             })
             .collect();
+        if self.tab_drag.is_some() && !cx.has_active_drag() {
+            self.tab_drag = None;
+        }
+        let dragging = self.tab_drag.as_ref().map(|d| d.tab_id.clone());
+        if let Some(drag) = &self.tab_drag {
+            if let Some(from) = tabs.iter().position(|t| t.2 == drag.tab_id) {
+                let tab = tabs.remove(from);
+                tabs.insert(drag.target.min(tabs.len()), tab);
+            }
+        }
+        let last_widths: std::collections::HashMap<String, Pixels> =
+            self.tab_bounds.borrow().iter().map(|(id, b)| (id.clone(), b.size.width)).collect();
+        self.tab_bounds.borrow_mut().clear();
         let shown = self.model.session_id.clone();
         let panes: Vec<(usize, String, SharedString)> = self
             .model
@@ -881,11 +944,26 @@ impl RootView {
             }
             bar = bar.child(div().flex_none().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::color(theme::BORDER)));
         }
-        let mut strip =
-            div().h_full().flex().flex_row().items_center().gap_1().flex_initial().min_w(px(0.0)).overflow_hidden();
+        let mut strip = div()
+            .id("tab-strip")
+            .h_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .flex_initial()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .on_drag_move(cx.listener(|view, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                let tab_id = event.drag(cx).tab_id.clone();
+                view.update_tab_drag(&tab_id, event.event.position.x, cx);
+            }));
         for (index, id, tab_id, title) in tabs {
             let active = selected.as_deref() == Some(id.as_str());
-            let dragged = DraggedTab { tab_id: tab_id.clone(), title: title.clone() };
+            let ghost = dragging.as_deref() == Some(tab_id.as_str());
+            let dragged = DraggedTab { tab_id: tab_id.clone(), title: title.clone(), width: last_widths.get(&tab_id).copied() };
+            let bounds_store = self.tab_bounds.clone();
+            let bounds_id = tab_id.clone();
             let mut label = pill(active)
                 .flex_1()
                 .min_w(px(0.0))
@@ -912,17 +990,22 @@ impl RootView {
             }
             let tab = slot(format!("tab-{index}").into())
                 .debug_selector(move || format!("tab-{index}"))
+                .relative()
                 .min_w(px(theme::TAB_MIN_WIDTH))
                 .max_w(px(260.0))
                 .overflow_hidden()
+                .when(ghost, |d| d.opacity(0.3))
                 .child(label)
+                .child(
+                    canvas(move |bounds, _, _| bounds_store.borrow_mut().push((bounds_id.clone(), bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                )
                 .on_click(cx.listener(move |view, _, _, cx| {
                     let effects = view.model.select_tab(&id);
                     view.apply_effects(effects, cx);
                 }))
-                .on_drag(dragged, |dragged: &DraggedTab, _, _, cx| cx.new(|_| dragged.clone()))
-                .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::color(theme::SELECTION)))
-                .on_drop(cx.listener(move |view, dragged: &DraggedTab, _, _| view.move_tab(&dragged.tab_id, index)));
+                .on_drag(dragged, |dragged: &DraggedTab, _, _, cx| cx.new(|_| dragged.clone()));
             strip = strip.child(tab);
         }
         bar = bar.child(strip).child(
@@ -952,7 +1035,8 @@ impl RootView {
                 );
             }
         }
-        bar.when(self.custom_titlebar, |d| d.child(self.render_window_buttons(window)))
+        bar.on_drop(cx.listener(|view, _: &DraggedTab, _, cx| view.finish_tab_drag(cx)))
+            .when(self.custom_titlebar, |d| d.child(self.render_window_buttons(window)))
             .children(self.render_resize_strip(window))
             .into_any_element()
     }

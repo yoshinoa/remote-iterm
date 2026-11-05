@@ -160,6 +160,21 @@ impl Model {
         }
     }
 
+    pub fn move_tab(&mut self, tab_id: &str, to: usize) {
+        let Some(window_id) = self.window_id.clone() else {
+            return;
+        };
+        let Some(window) = self.windows.iter_mut().find(|w| w.id == window_id) else {
+            return;
+        };
+        let Some(from) = window.tabs.iter().position(|t| t.tab_id == tab_id) else {
+            return;
+        };
+        let tab = window.tabs.remove(from);
+        let to = to.min(window.tabs.len());
+        window.tabs.insert(to, tab);
+    }
+
     pub fn select_adjacent_tab(&mut self, forward: bool) -> Vec<Effect> {
         let tabs = self.current_tabs();
         if tabs.is_empty() {
