@@ -56,6 +56,8 @@ pub struct Predictor {
     confirmed_epoch: bool,
     pending: Vec<Pending>,
     cursor: Option<(i64, usize)>,
+    stale: bool,
+    input_start: Option<(String, i64, usize)>,
 }
 
 fn is_blank(cell: Option<Cell>) -> bool {
@@ -71,6 +73,15 @@ impl Predictor {
         self.pending.clear();
         self.cursor = None;
         self.confirmed_epoch = false;
+        self.stale = false;
+    }
+
+    fn in_input(&self, session_id: &str, screen: &Content, line: i64, col: usize) -> bool {
+        !is_blank(screen.cell(line, col))
+            || self
+                .input_start
+                .as_ref()
+                .is_some_and(|(session, start_line, start)| session == session_id && *start_line == line && col >= *start)
     }
 
     fn can_predict_on(&self, screen: &Content, line: i64) -> bool {
@@ -93,6 +104,9 @@ impl Predictor {
         if self.session.as_deref() != Some(session_id) {
             self.reset();
             self.session = Some(session_id.to_string());
+        }
+        if self.stale {
+            return;
         }
         let Some((line, col)) = self.cursor.or_else(|| screen.cursor()) else {
             return self.reset();
@@ -121,12 +135,14 @@ impl Predictor {
                         self.pending.pop();
                         self.cursor = if self.pending.is_empty() { None } else { Some((line, target)) };
                     }
-                    Some(_) => {
-                        self.upsert(screen, line, target, Kind::Erased, ' ', now);
-                        self.cursor = Some((line, target));
+                    None if !self.in_input(session_id, screen, line, target) => {
+                        if self.pending.is_empty() {
+                            self.reset();
+                        } else {
+                            self.stale = true;
+                        }
                     }
-                    None if is_blank(screen.cell(line, target)) => self.reset(),
-                    None => {
+                    _ => {
                         self.upsert(screen, line, target, Kind::Erased, ' ', now);
                         self.cursor = Some((line, target));
                     }
@@ -136,12 +152,26 @@ impl Predictor {
     }
 
     pub fn on_content(&mut self, session_id: &str, screen: &Content, _now: Instant) {
-        if self.session.as_deref() != Some(session_id) || !screen.is_latest {
+        if !screen.is_latest {
             return;
         }
         let Some((cursor_line, cursor_col)) = screen.cursor() else {
             return;
         };
+        let text_before = screen
+            .line_text(cursor_line)
+            .is_some_and(|text| text.chars().take(cursor_col).any(|c| !c.is_whitespace()));
+        match &mut self.input_start {
+            Some((session, line, start)) if session == session_id && *line == cursor_line => {
+                if text_before {
+                    *start = (*start).min(cursor_col);
+                }
+            }
+            _ => self.input_start = text_before.then(|| (session_id.to_string(), cursor_line, cursor_col)),
+        }
+        if self.session.as_deref() != Some(session_id) {
+            return;
+        }
         let pending = std::mem::take(&mut self.pending);
         let mut kept = Vec::with_capacity(pending.len());
         for p in pending {
@@ -164,6 +194,10 @@ impl Predictor {
         self.pending = kept;
         if self.pending.is_empty() {
             self.cursor = None;
+            if self.stale {
+                self.stale = false;
+                self.confirmed_epoch = false;
+            }
         }
     }
 

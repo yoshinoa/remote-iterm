@@ -80,30 +80,41 @@ pub fn compose_row(runs: &[Run], overlay: &[(usize, char)]) -> (Vec<Run>, Option
             .unwrap_or_default();
         styles.push(base);
         let style = styles.len() - 1;
-        let same_style = |a: &Run, b: &Run| a.f == b.f && a.g == b.g && a.b == b.b && a.d == b.d && a.u == b.u;
         let original = cells.clone();
+        let left_of_cursor = |col: usize| cursor.is_some_and(|c| col < c);
+        let suggestion = cursor.filter(|&c| c > 0).and_then(|c| {
+            let &(_, style) = original.get(c)?;
+            let &(_, left) = original.get(c - 1)?;
+            let differs = styles[style].d || !styles[style].same_style(&styles[left]);
+            let visible = original[c..].iter().take_while(|&&(_, s)| styles[s].same_style(&styles[style])).any(|&(ch, _)| ch != ' ');
+            (differs && visible).then_some(style)
+        });
         for &(col, ch) in overlay {
             let Some(&(was, was_style)) = original.get(col) else {
                 continue;
             };
-            if was == ch || was == ' ' {
+            if was == ch || was == ' ' || left_of_cursor(col) {
                 continue;
             }
             let mut next = col + 1;
             while let Some(&(c, s)) = original.get(next) {
                 let gap = c == ' ' && original.get(next + 1).is_some_and(|&(n, _)| n == ' ');
-                if gap || !same_style(&styles[s], &styles[was_style]) {
+                if gap || !styles[s].same_style(&styles[was_style]) {
                     break;
                 }
                 cells[next] = (' ', 0);
                 next += 1;
             }
         }
+        let erased = |col: usize| overlay.iter().any(|&(c, ch)| c == col && ch == ' ') && left_of_cursor(col);
         for &(col, ch) in overlay {
             if cells.len() <= col {
                 cells.resize(col + 1, (' ', 0));
             }
-            cells[col] = (ch, style);
+            cells[col] = match (suggestion, cursor) {
+                (Some(ghost), Some(end)) if erased(col) && (col + 1..end).all(erased) => (original[col].0, ghost),
+                _ => (ch, style),
+            };
         }
     }
     let mut out: Vec<Run> = Vec::new();

@@ -15,6 +15,12 @@ pub struct Run {
     pub u: Option<String>,
 }
 
+impl Run {
+    pub fn same_style(&self, other: &Run) -> bool {
+        self.f == other.f && self.g == other.g && self.b == other.b && self.d == other.d && self.u == other.u
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Content {
@@ -102,12 +108,31 @@ impl Content {
         })
     }
 
+    pub fn suggestion(&self, line: i64) -> Option<std::ops::Range<usize>> {
+        let runs = self.line(line)?;
+        let at = runs.iter().position(|r| r.c)?;
+        let start: usize = runs[..at].iter().map(|r| r.t.chars().count()).sum();
+        let left = runs[..at].iter().rev().find(|r| !r.t.is_empty())?;
+        let mut after = runs[at + 1..].iter().filter(|r| !r.t.is_empty());
+        let first = after.next()?;
+        if first.t.trim().is_empty() || (!first.d && first.same_style(left)) {
+            return None;
+        }
+        let mut end = start + first.t.chars().count();
+        for run in after.take_while(|r| r.same_style(first)) {
+            end += run.t.chars().count();
+        }
+        Some(start..end)
+    }
+
     pub fn cell(&self, line: i64, col: usize) -> Option<Cell> {
+        let suggestion = self.suggestion(line);
         let mut remaining = col;
         for run in self.line(line)? {
             let len = run.t.chars().count();
             if remaining < len {
-                return run.t.chars().nth(remaining).map(|ch| Cell { ch, dim: run.d });
+                let dim = run.d || suggestion.as_ref().is_some_and(|s| s.contains(&col));
+                return run.t.chars().nth(remaining).map(|ch| Cell { ch, dim });
             }
             remaining -= len;
         }
